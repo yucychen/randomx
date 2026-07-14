@@ -156,12 +156,16 @@ always @(posedge clk or negedge rst_n) begin
         {out_r0,out_r1,out_r2,out_r3,out_r4,out_r5,out_r6,out_r7} <= {8{64'b0}};
     end else begin
         alu_en <= 1'b0;
-        wb_en  <= 1'b0;
         done   <= 1'b0;
 
-        // Writeback stage
-        if (wb_en && alu_valid) begin
-            rf[wb_dst] <= alu_result;
+        // Writeback stage: wb_en is held until alu_valid arrives
+        // alu_int has 1-cycle registered output, so wb_en must persist
+        if (wb_en) begin
+            if (alu_valid) begin
+                rf[wb_dst] <= alu_result;
+                wb_en      <= 1'b0;  // clear only after successful writeback
+            end
+            // else: hold wb_en high, waiting for alu_valid
         end
 
         case (state)

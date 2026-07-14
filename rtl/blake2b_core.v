@@ -110,7 +110,8 @@ wire [63:0] g_t1_d_xr = g_t0_d ^ g_t1_a;
 wire [63:0] g_t1_d    = {g_t1_d_xr[47:0], g_t1_d_xr[63:48]};      // ror16
 wire [63:0] g_t1_c    = g_t0_c + g_t1_d;
 wire [63:0] g_t1_b_xr = g_t0_b ^ g_t1_c;
-wire [63:0] g_t1_b    = {g_t1_b_xr[0], g_t1_b_xr[63:1]};          // ror63
+// ror63 = rotate right by 63 = rotate left by 1 = {x[62:0], x[63]}
+wire [63:0] g_t1_b    = {g_t1_b_xr[62:0], g_t1_b_xr[63]};         // ror63
 
 assign gva_out = g_t1_a;
 assign gvb_out = g_t1_b;

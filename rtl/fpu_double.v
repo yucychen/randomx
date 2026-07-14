@@ -72,10 +72,13 @@ wire [10:0] b_exp  = src_b[62:52];
 wire [51:0] b_mant = src_b[51:0];
 
 // ---------------------------------------------------------------------------
-// FSCAL_R: Flip sign bit and XOR exponent with 0x80E (RandomX spec §4.6.6)
-// FSCAL changes the "scale" of an FP number by modifying the exponent
+// FSCAL_R: Flip sign bit and XOR exponent bits with a constant mask
+// RandomX spec §4.6.6: applies dst.u ^= 0x80F0000000000000
+// That XOR mask affects bit 63 (sign) and bits [55:52] of the 64-bit value.
+// Decomposed: ~sign, exponent[62:52] ^ 11'h00F (bits 62-52 of 0x80F0000000000000)
+// TODO: verify exact exponent XOR mask against RandomX reference implementation
 // ---------------------------------------------------------------------------
-wire [63:0] fscal_result = {~a_sign, a_exp ^ 11'h40E, a_mant};
+wire [63:0] fscal_result = {~a_sign, a_exp ^ 11'h00F, a_mant};
 
 // ---------------------------------------------------------------------------
 // FSWAP_R: Swap high/low 32-bit halves of two 64-bit FP values

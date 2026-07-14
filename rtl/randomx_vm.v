@@ -323,9 +323,8 @@ always @(posedge clk or negedge rst_n) begin
                         state     <= ST_WB;
                     end
 
-                    // Memory read instructions
-                    OPC_IADD_M,
-                    OPC_ISUB_R: begin // TODO: distinguish _M variant properly
+                    // Memory read instructions (_M variants: load src from scratchpad)
+                    OPC_IADD_M: begin
                         sp_rd_en    <= 1'b1;
                         sp_rd_addr  <= mem_addr[20:0];
                         sp_rd_level <= mem_level;
@@ -405,8 +404,9 @@ always @(posedge clk or negedge rst_n) begin
                     end
 
                     OPC_CFROUND: begin
-                        // Update FP rounding mode from r_src
-                        fprc  <= r_src[1:0]; // TODO: apply ror(r_src,32)[1:0]
+                        // Update FP rounding mode: fprc = ror(r_src, 32)[1:0]
+                        // ror(x, 32) = {x[31:0], x[63:32]} for 64-bit x
+                        fprc  <= r_src[33:32]; // bits [1:0] of ror(r_src, 32)
                         state <= ST_WB;
                     end
 

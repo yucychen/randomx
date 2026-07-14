@@ -134,14 +134,19 @@ always @(posedge clk or negedge rst_n) begin
             end
 
             ST_RESP: begin
-                // TODO: Handle resp_ready backpressure properly
-                resp_valid <= 1'b1;
-                resp_data  <= {item_buf[1], item_buf[0]};
-                if (resp_ready) begin
+                // Hold resp_valid high until consumer accepts (resp_ready=1)
+                // resp_data is stable for the entire resp handshake window
+                if (!resp_valid) begin
+                    // First cycle in ST_RESP: present the data
+                    resp_valid <= 1'b1;
+                    resp_data  <= {item_buf[1], item_buf[0]};
+                end else if (resp_ready) begin
+                    // Handshake complete — de-assert valid and return to idle
                     resp_valid <= 1'b0;
                     state      <= ST_IDLE;
                     req_ready  <= 1'b1;
                 end
+                // If resp_valid=1 and resp_ready=0: hold valid (backpressure)
             end
 
             default: state <= ST_IDLE;
