@@ -105,6 +105,8 @@ alu_int u_alu (
     .src_b        (alu_src_b),
     .shift_amt    (alu_shift),
     .imm32_sext   (alu_imm),
+    .cond         (4'd0),        // no CBRANCH/ISTORE in SuperscalarHash
+    .mem_is_l1    (1'b0),
     .result       (alu_result),
     .result_valid (alu_valid),
     .branch_taken (),         // not used in SuperscalarHash

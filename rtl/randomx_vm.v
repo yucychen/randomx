@@ -16,10 +16,12 @@
 //
 // TODO: Implement full instruction decode for all 29 RandomX ISA instructions.
 // TODO: Implement FP register forwarding.
-// TODO: Implement CBRANCH logic with proper condition evaluation.
 // TODO: Implement CFROUND (FP rounding mode update).
 // TODO: Implement memory address generation (L1/L2/L3 scratchpad masking).
 //
+// CBRANCH is implemented: a compile pre-pass (ST_COMPILE) computes per-
+// instruction branch targets from register usage (RandomX spec 5.5.10),
+// and taken branches redirect ic to target+1 via ST_BR_WAIT.
 // Verilog-2001 compliant.
 // =============================================================================
 
@@ -141,6 +143,8 @@ alu_int u_alu (
     .src_b        (alu_b),
     .shift_amt    (alu_shift),
     .imm32_sext   (alu_imm),
+    .cond         (mod[7:4]),
+    .mem_is_l1    (mod[1:0] != 2'b00),
     .result       (alu_result),
     .result_valid (alu_valid),
     .branch_taken (branch_taken),
@@ -188,11 +192,28 @@ localparam ST_WB        = 4'd5;
 localparam ST_DS_FETCH  = 4'd6;  // dataset fetch for CFROUND/MX update
 localparam ST_FINAL     = 4'd7;  // final hash
 localparam ST_DONE      = 4'd8;
+localparam ST_COMPILE   = 4'd9;  // pre-pass: compute CBRANCH targets
+localparam ST_BR_WAIT   = 4'd10; // wait for CBRANCH ALU result
 
 reg [3:0] state;
 reg [3:0] wb_dst;
 reg       wb_int_en, wb_fp_en;
 reg       fp_hi_sel;  // 0=write lo half, 1=write hi half
+
+// ---------------------------------------------------------------------------
+// CBRANCH target table — filled by the ST_COMPILE pre-pass
+// target[j] = index of last instruction before j writing j's dst register
+// (or 0xFF if none / clobbered by a previous CBRANCH); jump goes to target+1
+// ---------------------------------------------------------------------------
+reg [7:0] branch_target [0:255];
+reg [7:0] reg_usage [0:7];
+reg [7:0] cc;                    // compile pass counter
+reg [7:0] cb_target_q;           // latched target of in-flight CBRANCH
+
+wire [63:0] c_instr = prog_mem[cc];
+wire [7:0]  c_op    = c_instr[63:56];
+wire [2:0]  c_dst   = c_instr[54:52];
+wire [2:0]  c_src   = c_instr[50:48];
 
 // Opcode categories (simplified — full decode TODO)
 localparam OPC_IADD_RS  = 8'd0;
@@ -289,7 +310,28 @@ always @(posedge clk or negedge rst_n) begin
                 if (start) begin
                     ic       <= 8'd0;
                     iter_cnt <= 3'd0;
-                    state    <= ST_FETCH;
+                    cc       <= 8'd0;
+                    for (i = 0; i < 8; i = i + 1) reg_usage[i] <= 8'hFF;
+                    state    <= ST_COMPILE;
+                end
+            end
+
+            ST_COMPILE: begin
+                // One instruction per cycle: track integer register usage and
+                // record CBRANCH targets (RandomX spec 5.5.10)
+                if (c_op == OPC_CBRANCH) begin
+                    branch_target[cc] <= reg_usage[c_dst];
+                    for (i = 0; i < 8; i = i + 1) reg_usage[i] <= cc;
+                end else if (c_op <= 8'd16 || c_op == OPC_ISWAP_R) begin
+                    reg_usage[c_dst] <= cc;
+                    if (c_op == OPC_ISWAP_R)
+                        reg_usage[c_src] <= cc;
+                end
+                if (cc == 8'd255) begin
+                    cc    <= 8'd0;
+                    state <= ST_FETCH;
+                end else begin
+                    cc <= cc + 8'd1;
                 end
             end
 
@@ -333,15 +375,16 @@ always @(posedge clk or negedge rst_n) begin
 
                     // CBRANCH
                     OPC_CBRANCH: begin
-                        alu_op    <= 6'd17;
-                        alu_a     <= r_dst;
-                        alu_b     <= 64'b0;
-                        alu_imm   <= imm64_sext;
-                        alu_shift <= 2'd0;
-                        alu_en    <= 1'b1;
-                        wb_dst    <= dst_idx;
-                        wb_int_en <= 1'b1;
-                        state     <= ST_WB;
+                        alu_op      <= 6'd17;
+                        alu_a       <= r_dst;
+                        alu_b       <= 64'b0;
+                        alu_imm     <= imm64_sext;
+                        alu_shift   <= 2'd0;
+                        alu_en      <= 1'b1;
+                        wb_dst      <= dst_idx;
+                        wb_int_en   <= 1'b1;
+                        cb_target_q <= branch_target[ic];
+                        state       <= ST_BR_WAIT;
                     end
 
                     // ISTORE
@@ -454,6 +497,29 @@ always @(posedge clk or negedge rst_n) begin
                 end else begin
                     ic    <= ic + 8'd1;
                     state <= ST_FETCH;
+                end
+            end
+
+            ST_BR_WAIT: begin
+                // Wait for registered CBRANCH result (dst writeback happens
+                // via the global alu_valid && wb_int_en block above)
+                if (alu_valid) begin
+                    if (branch_taken) begin
+                        // Jump back to target+1 (0xFF+1 wraps to 0)
+                        ic    <= cb_target_q + 8'd1;
+                        state <= ST_FETCH;
+                    end else if (ic == 8'd255) begin
+                        ic <= 8'd0;
+                        if (iter_cnt == 3'd7) begin
+                            state <= ST_FINAL;
+                        end else begin
+                            iter_cnt <= iter_cnt + 3'd1;
+                            state    <= ST_FETCH;
+                        end
+                    end else begin
+                        ic    <= ic + 8'd1;
+                        state <= ST_FETCH;
+                    end
                 end
             end
 

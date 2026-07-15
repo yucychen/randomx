@@ -13,7 +13,7 @@
 randomx/
 ├── rtl/                    # RTL 源码（纯 Verilog-2001）
 │   ├── randomx_top.v       # 顶层模块：时钟/复位、寄存器接口、主 FSM
-│   ├── blake2b_core.v      # Blake2b-512 哈希核（G函数数据通路骨架）
+│   ├── blake2b_core.v      # Blake2b-512 哈希核（完整 12 轮压缩，已验证）
 │   ├── aes_round.v         # AES 单轮函数（SubBytes/ShiftRows/MixColumns/ARK）
 │   ├── aes_gen1r.v         # AesGenerator1R（1轮AES × 4 lane）
 │   ├── aes_gen4r.v         # AesGenerator4R（4轮AES × 4 lane）
@@ -26,7 +26,8 @@ randomx/
 │   ├── hbm_dataset_if.v    # HBM2 AXI4 主设备接口骨架（数据集访问）
 │   └── argon2_fill.v       # Argon2d Cache 填充骨架（基于 Blake2b）
 ├── sim/
-│   └── tb_randomx_top.v    # 基础功能仿真 testbench
+│   ├── tb_randomx_top.v    # 基础功能仿真 testbench
+│   └── tb_blake2b.v        # Blake2b-512 RFC 7693 测试向量 testbench
 ├── vivado/
 │   ├── build.tcl           # Vivado TCL 构建脚本（非项目模式）
 │   └── constraints.xdc     # 时序约束（300 MHz 时钟 + HBM 占位符）
@@ -120,10 +121,10 @@ randomx/
 - **主 FSM**：IDLE → CACHE_INIT → VM_RUN → FINAL_HASH → DONE
 - **TODO**：DS_GEN 阶段、完整 AXI-Lite 握手
 
-### `blake2b_core.v` — Blake2b-512 哈希核
-- G 函数数据通路（rotr32/rotr24/rotr16/rotr63 已实现）
-- 12轮×8步计数 FSM 骨架（约96周期/压缩）
-- **TODO**：完整 sigma 置换表（已实现第0、1轮）、完整 G 函数调度
+### `blake2b_core.v` — Blake2b-512 哈希核（**已完成**）
+- G 函数数据通路（rotr32/rotr24/rotr16/rotr63）
+- 完整 sigma 置换表（12 轮）与 G 函数逐步调度（每周期 1 次 G 调用，约96周期/压缩）
+- 已通过 RFC 7693 测试向量验证（`sim/tb_blake2b.v`）
 
 ### `aes_round.v` — AES 单轮函数
 - SubBytes：256 项 LUT S-box（纯组合逻辑）
@@ -152,7 +153,9 @@ randomx/
 ### `alu_int.v` — 整数执行单元
 - 完整 RandomX 整数 ISA：IADD_RS, ISUB, IMUL, IMULH, ISMULH, INEG, IXOR, IROR/IROL, ISWAP, CBRANCH, ISTORE
 - 有符号/无符号 128-bit 乘法（高64位提取）
-- **TODO**：IMUL_RCP（模乘倒数）、CBRANCH 条件掩码
+- CBRANCH 条件掩码/分支判定（规范 5.5.10）；ISTORE L1/L2/L3 级别按 mod 字段解码
+- VM 侧：ST_COMPILE 预编译遍历按寄存器使用情况计算分支目标，跳转回 target+1
+- **TODO**：IMUL_RCP（模乘倒数）
 
 ### `fpu_double.v` — 双精度浮点单元
 - FSCAL_R：符号位异或 + 指数异或（**已实现**）
@@ -241,6 +244,10 @@ iverilog -g2001 -DSIMULATION \
     sim/tb_randomx_top.v
 
 vvp sim/tb_randomx_top.vvp
+
+# Blake2b 核单元测试（RFC 7693 "abc" 测试向量）
+iverilog -g2001 -o sim/tb_blake2b.vvp rtl/blake2b_core.v sim/tb_blake2b.v
+vvp sim/tb_blake2b.vvp   # 输出 PASS
 
 # 查看波形（需安装 GTKWave）
 gtkwave tb_randomx_top.vcd

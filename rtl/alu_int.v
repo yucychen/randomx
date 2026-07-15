@@ -12,8 +12,6 @@
 //
 // TODO: IMUL_RCP (reciprocal multiply) requires a lookup table or division
 //       unit for the 64-bit modular inverse — currently stubbed.
-// TODO: IMULH/ISMULH require 128-bit product extraction.
-// TODO: CBRANCH condition check and branch target update.
 //
 // Verilog-2001 compliant.
 // =============================================================================
@@ -35,6 +33,10 @@ module alu_int (
     // For IADD_RS: shift amount (2 bits) and condition modifiers
     input  wire [1:0]   shift_amt,   // shift for IADD_RS
     input  wire [63:0]  imm32_sext,  // Sign-extended 32-bit immediate
+
+    // mod byte fields (from instruction decoder)
+    input  wire [3:0]   cond,        // mod.cond: CBRANCH condition / ISTORE L3 select
+    input  wire         mem_is_l1,   // mod.mem != 0: ISTORE targets L1 (else L2)
 
     // Result
     output reg  [63:0]  result,
@@ -98,6 +100,18 @@ wire [63:0]  ismulh_res = (a_neg ^ b_neg) ? ismulh_res_neg : ismulh_res_pos;
 wire [5:0]   rot_amt   = src_b[5:0];
 wire [63:0]  ror_res   = (src_a >> rot_amt) | (src_a << (6'd63 - rot_amt + 6'd1));
 wire [63:0]  rol_res   = (src_a << rot_amt) | (src_a >> (6'd63 - rot_amt + 6'd1));
+
+// ---------------------------------------------------------------------------
+// CBRANCH condition logic (RandomX spec 5.5.10)
+//   shift = mod.cond + ConditionOffset(8)
+//   imm   = imm32_sext | (1 << shift); imm &= ~(1 << (shift-1))
+//   dst  += imm; branch if (dst & (255 << shift)) == 0
+// ---------------------------------------------------------------------------
+wire [4:0]  cb_shift = {1'b0, cond} + 5'd8;          // 8..23
+wire [63:0] cb_imm   = (imm32_sext | (64'd1 << cb_shift))
+                     & ~(64'd1 << (cb_shift - 5'd1));
+wire [63:0] cb_res   = src_a + cb_imm;
+wire        cb_taken = ((cb_res & (64'hFF << cb_shift)) == 64'b0);
 
 // ---------------------------------------------------------------------------
 // Combinational result MUX
@@ -177,11 +191,9 @@ always @(posedge clk or negedge rst_n) begin
                 end
 
                 OP_CBRANCH: begin
-                    // dst += imm32; if (dst & cond_mask == 0) branch
-                    // TODO: Implement condition mask and branch logic properly
-                    result       <= src_a + imm32_sext;
-                    // TODO: branch_taken = ((src_a + imm32_sext) & cond_mask == 0)
-                    branch_taken <= 1'b0; // placeholder
+                    // dst += modified imm; branch if condition byte is zero
+                    result       <= cb_res;
+                    branch_taken <= cb_taken;
                 end
 
                 OP_ISTORE: begin
@@ -190,7 +202,9 @@ always @(posedge clk or negedge rst_n) begin
                     mem_wr_en    <= 1'b1;
                     mem_wr_addr  <= src_a + imm32_sext;
                     mem_wr_data  <= src_b;
-                    mem_wr_level <= 2'd2; // TODO: decode level from instruction
+                    // Spec: mod.cond >= 14 → L3, else mod.mem selects L1/L2
+                    mem_wr_level <= (cond >= 4'd14) ? 2'd2
+                                                    : (mem_is_l1 ? 2'd0 : 2'd1);
                 end
 
                 default:
