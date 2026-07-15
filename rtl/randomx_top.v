@@ -47,7 +47,22 @@ module randomx_top (
     input  wire [1:0]   m_axi_rresp,
     input  wire         m_axi_rlast,
     input  wire         m_axi_rvalid,
-    output wire         m_axi_rready
+    output wire         m_axi_rready,
+    // Write channels (dataset generation — driver TODO: superscalar_hash)
+    output wire [33:0]  m_axi_awaddr,
+    output wire [7:0]   m_axi_awlen,
+    output wire [2:0]   m_axi_awsize,
+    output wire [1:0]   m_axi_awburst,
+    output wire         m_axi_awvalid,
+    input  wire         m_axi_awready,
+    output wire [255:0] m_axi_wdata,
+    output wire [31:0]  m_axi_wstrb,
+    output wire         m_axi_wlast,
+    output wire         m_axi_wvalid,
+    input  wire         m_axi_wready,
+    input  wire [1:0]   m_axi_bresp,
+    input  wire         m_axi_bvalid,
+    output wire         m_axi_bready
 );
 
 // ===========================================================================
@@ -192,6 +207,11 @@ hbm_dataset_if #(
     .resp_valid     (ds_resp_valid),
     .resp_data      (ds_resp_data),
     .resp_ready     (ds_resp_ready),
+    .wr_req_valid   (1'b0),            // TODO: drive from superscalar_hash
+    .wr_req_item_idx(32'b0),
+    .wr_req_data    (512'b0),
+    .wr_req_ready   (),
+    .wr_done        (),
     .m_axi_arid     (),                // ID not connected to top
     .m_axi_araddr   (m_axi_araddr),
     .m_axi_arlen    (m_axi_arlen),
@@ -204,7 +224,23 @@ hbm_dataset_if #(
     .m_axi_rresp    (m_axi_rresp),
     .m_axi_rlast    (m_axi_rlast),
     .m_axi_rvalid   (m_axi_rvalid),
-    .m_axi_rready   (m_axi_rready)
+    .m_axi_rready   (m_axi_rready),
+    .m_axi_awid     (),
+    .m_axi_awaddr   (m_axi_awaddr),
+    .m_axi_awlen    (m_axi_awlen),
+    .m_axi_awsize   (m_axi_awsize),
+    .m_axi_awburst  (m_axi_awburst),
+    .m_axi_awvalid  (m_axi_awvalid),
+    .m_axi_awready  (m_axi_awready),
+    .m_axi_wdata    (m_axi_wdata),
+    .m_axi_wstrb    (m_axi_wstrb),
+    .m_axi_wlast    (m_axi_wlast),
+    .m_axi_wvalid   (m_axi_wvalid),
+    .m_axi_wready   (m_axi_wready),
+    .m_axi_bid      (6'b0),
+    .m_axi_bresp    (m_axi_bresp),
+    .m_axi_bvalid   (m_axi_bvalid),
+    .m_axi_bready   (m_axi_bready)
 );
 
 // --- AesHash1R ---

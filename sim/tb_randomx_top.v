@@ -55,6 +55,16 @@ wire [2:0]  m_axi_arsize;
 wire [1:0]  m_axi_arburst;
 wire        m_axi_arvalid;
 wire        m_axi_rready;
+wire [33:0] m_axi_awaddr;
+wire [7:0]  m_axi_awlen;
+wire [2:0]  m_axi_awsize;
+wire [1:0]  m_axi_awburst;
+wire        m_axi_awvalid;
+wire [255:0] m_axi_wdata;
+wire [31:0] m_axi_wstrb;
+wire        m_axi_wlast;
+wire        m_axi_wvalid;
+wire        m_axi_bready;
 
 // ---------------------------------------------------------------------------
 // DUT instantiation
@@ -79,7 +89,21 @@ randomx_top u_dut (
     .m_axi_rresp   (2'b0),
     .m_axi_rlast   (1'b0),
     .m_axi_rvalid  (1'b0),
-    .m_axi_rready  (m_axi_rready)
+    .m_axi_rready  (m_axi_rready),
+    .m_axi_awaddr  (m_axi_awaddr),
+    .m_axi_awlen   (m_axi_awlen),
+    .m_axi_awsize  (m_axi_awsize),
+    .m_axi_awburst (m_axi_awburst),
+    .m_axi_awvalid (m_axi_awvalid),
+    .m_axi_awready (1'b0),
+    .m_axi_wdata   (m_axi_wdata),
+    .m_axi_wstrb   (m_axi_wstrb),
+    .m_axi_wlast   (m_axi_wlast),
+    .m_axi_wvalid  (m_axi_wvalid),
+    .m_axi_wready  (1'b0),
+    .m_axi_bresp   (2'b0),
+    .m_axi_bvalid  (1'b0),
+    .m_axi_bready  (m_axi_bready)
 );
 
 // ---------------------------------------------------------------------------

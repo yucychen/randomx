@@ -144,11 +144,12 @@ randomx/
 - XCVU33P 配置：需约 222 块 URAM（总共 320 块）
 - 仿真模式（`-DSIMULATION`）：缩减为 4096 × 64-bit
 
-### `hbm_dataset_if.v` — HBM2 数据集 AXI4 主设备
-- AXI4 读通道主设备骨架（AR + R 通道）
-- 256-bit 总线宽度（HBM 伪通道带宽）
-- 64字节对齐的 Dataset 条目请求/响应 FIFO 接口
-- **TODO**：连接到 Vivado HBM IP；写通道（数据集生成时）
+### `hbm_dataset_if.v` — HBM2 数据集 AXI4 主设备（**已实现**）
+- AXI4 读通道主设备（AR + R 通道），256-bit 总线宽度（HBM 伪通道带宽）
+- 请求 FIFO + 多事务流水（最多 4 个未完成读事务，单 ID 保序）
+- AXI4 写通道（AW + W + B），供数据集生成阶段写入 64 字节条目
+- 单元测试：`sim/tb_hbm_dataset_if.v`（含行为级 AXI 从设备模型）
+- **TODO**：连接到 Vivado HBM IP；将写接口接到 superscalar_hash
 
 ### `alu_int.v` — 整数执行单元
 - 完整 RandomX 整数 ISA：IADD_RS, ISUB, IMUL, IMULH, ISMULH, INEG, IXOR, IROR/IROL, ISWAP, CBRANCH, ISTORE
@@ -280,7 +281,7 @@ done
 | aes_gen1r/4r.v   | 骨架       | 从种子派生正确轮密钥                         |
 | aes_hash1r.v     | 骨架       | 从种子派生正确轮密钥                         |
 | scratchpad_mem.v | **已实现** | 无（URAM 推断、L1/L2/L3 掩码）             |
-| hbm_dataset_if.v | 骨架       | 连接 HBM IP、写通道、多事务流水             |
+| hbm_dataset_if.v | **已实现** | 连接 HBM IP、写接口接到 superscalar_hash    |
 | alu_int.v        | 骨架       | IMUL_RCP（倒数计算）、CBRANCH 条件掩码     |
 | fpu_double.v     | 骨架       | FADD/FSUB/FMUL（IEEE 754）、FDIV/FSQRT   |
 | superscalar_hash.v| 骨架      | 超标量调度、完整指令集编码                   |
