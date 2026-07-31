@@ -209,8 +209,17 @@ wire                 r_fire      = m_axi_rvalid && m_axi_rready;
 wire                 r_beat_err  = (m_axi_rresp != 2'b00);
 wire                 item_retire = r_fire && m_axi_rlast;
 wire                 resp_push   = item_retire;
-wire [ITEM_BITS-1:0] rd_shift_nxt = {m_axi_rdata,
-                                     rd_shift[ITEM_BITS-1:AXI_DATA_WIDTH]};
+// (BEATS_PER_ITEM == 1 → the beat is the whole item; the part-select below
+//  would be reversed, so it is guarded by a generate block.)
+wire [ITEM_BITS-1:0] rd_shift_nxt;
+generate
+    if (BEATS_PER_ITEM > 1) begin : g_multi_beat
+        assign rd_shift_nxt = {m_axi_rdata,
+                               rd_shift[ITEM_BITS-1:AXI_DATA_WIDTH]};
+    end else begin : g_single_beat
+        assign rd_shift_nxt = m_axi_rdata;
+    end
+endgenerate
 
 integer i;
 
