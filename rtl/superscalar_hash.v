@@ -1,26 +1,45 @@
 // =============================================================================
-// superscalar_hash.v — SuperscalarHash skeleton
+// superscalar_hash.v — SuperscalarHash execution unit
 // Part of RandomX FPGA framework targeting Xilinx XCVU33P
 //
 // SuperscalarHash is used during dataset item generation.
-// It executes a randomly generated "superscalar program" of integer instructions
-// over 8 × 64-bit registers (r0..r7), producing a deterministic hash of
-// the dataset item index combined with cache data.
+// It executes a randomly generated "superscalar program" of integer
+// instructions over 8 x 64-bit registers (r0..r7), producing a deterministic
+// hash of the dataset item index combined with cache data.
 //
-// Each SuperscalarHash program:
-//   - Up to 3170 instructions (RANDOMX_SUPERSCALAR_MAX_LATENCY * SLOTS)
-//   - Instruction types: IADD_RS, IADD_C7/C8/C9, ISUB_R, IMUL_R, UMULH_R,
-//                        SMULH_R, IMUL_RCP, IROR_C, IXOR_R, ISWAP_R
-//   - Executed in-order but with superscalar latency scheduling
+// Instruction set (RandomX spec §6.2 / superscalar.hpp), all operands 64-bit:
+//   ISUB_R   : dst = dst - src
+//   IXOR_R   : dst = dst ^ src
+//   IADD_RS  : dst = dst + (src << mod_shift)
+//   IMUL_R   : dst = dst * src                       (low 64 bits)
+//   IROR_C   : dst = ror(dst, imm32 % 64)
+//   IADD_C7/8/9 : dst = dst + signExtend2sCompl(imm32)
+//   IXOR_C7/8/9 : dst = dst ^ signExtend2sCompl(imm32)
+//   IMULH_R  : dst = hi64_unsigned(dst * src)
+//   ISMULH_R : dst = hi64_signed(dst * src)
+//   IMUL_RCP : dst = dst * reciprocal(imm32)
+// (The C7/C8/C9 variants only differ in their x86 encoding length, the
+//  arithmetic behaviour is identical.)
 //
-// This skeleton:
-//   - Provides an instruction buffer (program_mem)
-//   - Implements a simple in-order sequential execution FSM
-//   - Drives alu_int for integer operations
-//   - Produces 8 × 64-bit output register file
+// Instruction word encoding used by this core (filled by the program
+// generator / cache-init logic):
+//   [63:56] opcode   — SuperscalarInstructionType (see SS_* localparams)
+//   [55:53] dst      — destination register index (r0..r7)
+//   [52:50] src      — source register index (r0..r7), unused by *_C / IROR_C
+//   [49:48] mod_shift— shift amount for IADD_RS (0..3)
+//   [47:32] reserved — must be zero
+//   [31: 0] imm32    — immediate (zero-extended for IROR_C / IMUL_RCP,
+//                      sign-extended for IADD_C* / IXOR_C*)
 //
-// TODO: Implement the superscalar scheduling (parallel execution ports).
-// TODO: Implement full instruction decode for all SuperscalarHash opcodes.
+// Micro-architecture: strictly in-order, one instruction at a time.
+// Each instruction is issued to alu_int and retired (register writeback)
+// before the next one is fetched, which removes all RAW/WAW hazards of the
+// registered ALU output. IMUL_RCP first runs the reciprocal unit
+// (restoring division, 64+bsr(divisor) cycles) and then issues a plain
+// 64x64 multiply.
+//
+// TODO: superscalar scheduling (multiple parallel execution ports) — the
+//       result is bit-identical, this is a throughput optimisation only.
 //
 // Verilog-2001 compliant.
 // =============================================================================
@@ -50,6 +69,8 @@ module superscalar_hash (
     output reg  [63:0]  out_r0, out_r1, out_r2, out_r3,
     output reg  [63:0]  out_r4, out_r5, out_r6, out_r7,
 
+    // Status
+    output reg          busy,
     // Done pulse
     output reg          done
 );
@@ -70,29 +91,55 @@ end
 reg [63:0] rf [0:7]; // r0..r7
 
 // ---------------------------------------------------------------------------
-// Instruction decode fields (from 64-bit instruction word)
-// RandomX SuperscalarHash instruction encoding (simplified):
-//   [63:56] = opcode
-//   [55:53] = dst register index
-//   [52:50] = src register index
-//   [49:32] = immediate (18-bit, sign-extended to 64)
-//   [31: 0] = additional immediate
-// TODO: Verify exact bit encoding against RandomX spec §7
+// Instruction decode fields
 // ---------------------------------------------------------------------------
-reg [63:0] cur_instr;
+reg  [63:0] cur_instr;
 wire [7:0]  ss_opcode  = cur_instr[63:56];
 wire [2:0]  ss_dst_idx = cur_instr[55:53];
 wire [2:0]  ss_src_idx = cur_instr[52:50];
-wire [63:0] ss_imm     = {{46{cur_instr[49]}}, cur_instr[49:32]};
+wire [1:0]  ss_shift   = cur_instr[49:48];
+wire [31:0] ss_imm32   = cur_instr[31:0];
+wire [63:0] ss_imm_sx  = {{32{ss_imm32[31]}}, ss_imm32};  // sign-extended
+wire [63:0] ss_imm_zx  = {32'b0, ss_imm32};               // zero-extended
 
 // Register file read mux
 wire [63:0] rf_dst = rf[ss_dst_idx];
 wire [63:0] rf_src = rf[ss_src_idx];
 
-// ALU control
+// ---------------------------------------------------------------------------
+// SuperscalarHash opcodes (values match RandomX SuperscalarInstructionType)
+// ---------------------------------------------------------------------------
+localparam SS_ISUB_R   = 8'd0;
+localparam SS_IXOR_R   = 8'd1;
+localparam SS_IADD_RS  = 8'd2;
+localparam SS_IMUL_R   = 8'd3;
+localparam SS_IROR_C   = 8'd4;
+localparam SS_IADD_C7  = 8'd5;
+localparam SS_IXOR_C7  = 8'd6;
+localparam SS_IADD_C8  = 8'd7;
+localparam SS_IXOR_C8  = 8'd8;
+localparam SS_IADD_C9  = 8'd9;
+localparam SS_IXOR_C9  = 8'd10;
+localparam SS_IMULH_R  = 8'd11;
+localparam SS_ISMULH_R = 8'd12;
+localparam SS_IMUL_RCP = 8'd13;
+
+// alu_int opcode encoding (see rtl/alu_int.v)
+localparam ALU_IADD_RS  = 6'd0;
+localparam ALU_ISUB_R   = 6'd2;
+localparam ALU_IMUL_R   = 6'd4;
+localparam ALU_IMULH_R  = 6'd6;
+localparam ALU_ISMULH_R = 6'd8;
+localparam ALU_IXOR_R   = 6'd12;
+localparam ALU_IROR_R   = 6'd14;
+
+// ---------------------------------------------------------------------------
+// Integer ALU (shared datapath with the VM execution unit)
+// ---------------------------------------------------------------------------
 reg  [5:0]  alu_opcode;
 reg  [63:0] alu_src_a, alu_src_b, alu_imm;
 reg  [1:0]  alu_shift;
+reg         alu_en;
 wire [63:0] alu_result;
 wire        alu_valid;
 
@@ -116,111 +163,228 @@ alu_int u_alu (
     .mem_wr_level ()
 );
 
-// FSM
-localparam ST_IDLE  = 2'd0;
-localparam ST_FETCH = 2'd1;
-localparam ST_EXEC  = 2'd2;
-localparam ST_DONE  = 2'd3;
+// ---------------------------------------------------------------------------
+// IMUL_RCP reciprocal unit (RandomX spec §5.5.11 / reciprocal.c)
+//
+//   quotient  = 2^63 / divisor, remainder = 2^63 % divisor
+//   repeat bsr(divisor) times:  (bsr = number of significant bits)
+//       if (2*remainder >= divisor) { quotient = 2*quotient + 1;
+//                                     remainder = 2*remainder - divisor; }
+//       else                       { quotient = 2*quotient;
+//                                     remainder = 2*remainder; }
+//
+// Both loops are identical restoring-division steps, therefore the whole
+// computation is a single restoring division of 2^(63+bsr) by the divisor,
+// executed one bit per clock cycle.
+// ---------------------------------------------------------------------------
+reg  [63:0] rcp_divisor;   // zero-extended imm32 (never zero in valid programs)
+reg  [64:0] rcp_rem;
+reg  [63:0] rcp_quot;
+reg  [7:0]  rcp_cnt;       // remaining division steps
+reg         rcp_first;
 
-reg [1:0]  state;
+// bsr: index of the highest set bit of the divisor + 1 (1..32)
+reg  [5:0]  rcp_bsr;
+integer     b;
+always @(*) begin
+    rcp_bsr = 6'd0;
+    for (b = 0; b < 32; b = b + 1)
+        if (rcp_divisor[b])
+            rcp_bsr = b[5:0] + 6'd1;
+end
+
+wire [64:0] rcp_rem_shift = {rcp_rem[63:0], 1'b0} | {64'b0, rcp_first};
+wire        rcp_ge        = (rcp_rem_shift >= {1'b0, rcp_divisor});
+
+// ---------------------------------------------------------------------------
+// Control FSM
+// ---------------------------------------------------------------------------
+localparam ST_IDLE  = 3'd0;
+localparam ST_FETCH = 3'd1;
+localparam ST_DECODE= 3'd2;
+localparam ST_RCP   = 3'd3;
+localparam ST_ISSUE = 3'd4;
+localparam ST_WB    = 3'd5;
+localparam ST_DONE  = 3'd6;
+
+reg [2:0]  state;
 reg [11:0] pc;
-reg        alu_en;
-reg [2:0]  wb_dst;  // writeback destination register
-reg        wb_en;   // writeback enable
+reg [2:0]  wb_dst;      // writeback destination register
 
-// Opcode mappings for SuperscalarHash (TODO: match spec table exactly)
-localparam SS_IADD_RS  = 8'd0;
-localparam SS_IADD_C9  = 8'd1;
-localparam SS_ISUB_R   = 8'd2;
-localparam SS_IMUL_R   = 8'd3;
-localparam SS_UMULH_R  = 8'd4;
-localparam SS_SMULH_R  = 8'd5;
-localparam SS_IMUL_RCP = 8'd6;
-localparam SS_IROR_C   = 8'd7;
-localparam SS_IXOR_R   = 8'd8;
-localparam SS_ISWAP_R  = 8'd9;
+integer i;
 
 always @(posedge clk or negedge rst_n) begin
     if (!rst_n) begin
-        state      <= ST_IDLE;
-        pc         <= 12'd0;
-        alu_en     <= 1'b0;
-        wb_en      <= 1'b0;
-        done       <= 1'b0;
-        cur_instr  <= 64'b0;
-        alu_opcode <= 6'd0;
-        alu_src_a  <= 64'b0;
-        alu_src_b  <= 64'b0;
-        alu_shift  <= 2'd0;
-        alu_imm    <= 64'b0;
-        wb_dst     <= 3'd0;
-        {rf[0],rf[1],rf[2],rf[3],rf[4],rf[5],rf[6],rf[7]} <= {8{64'b0}};
-        {out_r0,out_r1,out_r2,out_r3,out_r4,out_r5,out_r6,out_r7} <= {8{64'b0}};
+        state       <= ST_IDLE;
+        pc          <= 12'd0;
+        alu_en      <= 1'b0;
+        busy        <= 1'b0;
+        done        <= 1'b0;
+        cur_instr   <= 64'b0;
+        alu_opcode  <= 6'd0;
+        alu_src_a   <= 64'b0;
+        alu_src_b   <= 64'b0;
+        alu_shift   <= 2'd0;
+        alu_imm     <= 64'b0;
+        wb_dst      <= 3'd0;
+        rcp_divisor <= 64'b0;
+        rcp_rem     <= 65'b0;
+        rcp_quot    <= 64'b0;
+        rcp_cnt     <= 8'd0;
+        rcp_first   <= 1'b0;
+        for (i = 0; i < 8; i = i + 1)
+            rf[i] <= 64'b0;
+        out_r0 <= 64'b0; out_r1 <= 64'b0; out_r2 <= 64'b0; out_r3 <= 64'b0;
+        out_r4 <= 64'b0; out_r5 <= 64'b0; out_r6 <= 64'b0; out_r7 <= 64'b0;
     end else begin
         alu_en <= 1'b0;
         done   <= 1'b0;
 
-        // Writeback stage: wb_en is held until alu_valid arrives
-        // alu_int has 1-cycle registered output, so wb_en must persist
-        if (wb_en) begin
-            if (alu_valid) begin
-                rf[wb_dst] <= alu_result;
-                wb_en      <= 1'b0;  // clear only after successful writeback
-            end
-            // else: hold wb_en high, waiting for alu_valid
-        end
-
         case (state)
+            // -----------------------------------------------------------
             ST_IDLE: begin
+                busy <= 1'b0;
                 if (start) begin
-                    // Load initial registers
                     rf[0] <= init_r0; rf[1] <= init_r1;
                     rf[2] <= init_r2; rf[3] <= init_r3;
                     rf[4] <= init_r4; rf[5] <= init_r5;
                     rf[6] <= init_r6; rf[7] <= init_r7;
                     pc    <= 12'd0;
+                    busy  <= 1'b1;
                     state <= ST_FETCH;
                 end
             end
 
+            // -----------------------------------------------------------
             ST_FETCH: begin
                 if (pc >= prog_len) begin
                     state <= ST_DONE;
                 end else begin
                     cur_instr <= prog_mem[pc];
-                    state     <= ST_EXEC;
+                    pc        <= pc + 12'd1;
+                    state     <= ST_DECODE;
                 end
             end
 
-            ST_EXEC: begin
-                // Decode and dispatch to ALU
-                // TODO: Complete full opcode mapping
-                case (ss_opcode)
-                    SS_IADD_RS: begin alu_opcode <= 6'd0; alu_shift <= cur_instr[51:50]; end
-                    SS_ISUB_R:  begin alu_opcode <= 6'd2; alu_shift <= 2'd0; end
-                    SS_IMUL_R:  begin alu_opcode <= 6'd4; alu_shift <= 2'd0; end
-                    SS_UMULH_R: begin alu_opcode <= 6'd6; alu_shift <= 2'd0; end
-                    SS_SMULH_R: begin alu_opcode <= 6'd8; alu_shift <= 2'd0; end
-                    SS_IMUL_RCP:begin alu_opcode <= 6'd10; alu_shift <= 2'd0; end
-                    SS_IXOR_R:  begin alu_opcode <= 6'd12; alu_shift <= 2'd0; end
-                    default:    begin alu_opcode <= 6'd0; alu_shift <= 2'd0; end
-                endcase
+            // -----------------------------------------------------------
+            // Decode: map the SuperscalarHash opcode onto the alu_int ISA.
+            // Register operands are sampled here, one instruction is in
+            // flight at a time so no forwarding is required.
+            // -----------------------------------------------------------
+            ST_DECODE: begin
                 alu_src_a <= rf_dst;
                 alu_src_b <= rf_src;
-                alu_imm   <= ss_imm;
-                alu_en    <= 1'b1;
+                alu_shift <= 2'd0;
+                alu_imm   <= 64'b0;
                 wb_dst    <= ss_dst_idx;
-                wb_en     <= 1'b1;
-                pc        <= pc + 12'd1;
-                state     <= ST_FETCH;
+                state     <= ST_ISSUE;
+
+                case (ss_opcode)
+                    SS_ISUB_R: begin
+                        alu_opcode <= ALU_ISUB_R;
+                    end
+                    SS_IXOR_R: begin
+                        alu_opcode <= ALU_IXOR_R;
+                    end
+                    SS_IADD_RS: begin
+                        alu_opcode <= ALU_IADD_RS;
+                        alu_shift  <= ss_shift;
+                    end
+                    SS_IMUL_R: begin
+                        alu_opcode <= ALU_IMUL_R;
+                    end
+                    SS_IROR_C: begin
+                        // rotate right by a constant: reuse IROR_R, the ALU
+                        // only looks at the low 6 bits of src_b
+                        alu_opcode <= ALU_IROR_R;
+                        alu_src_b  <= ss_imm_zx;
+                    end
+                    SS_IADD_C7, SS_IADD_C8, SS_IADD_C9: begin
+                        // dst = dst + sext(imm32): IADD_RS with src = 0
+                        alu_opcode <= ALU_IADD_RS;
+                        alu_src_b  <= 64'b0;
+                        alu_imm    <= ss_imm_sx;
+                    end
+                    SS_IXOR_C7, SS_IXOR_C8, SS_IXOR_C9: begin
+                        alu_opcode <= ALU_IXOR_R;
+                        alu_src_b  <= ss_imm_sx;
+                    end
+                    SS_IMULH_R: begin
+                        alu_opcode <= ALU_IMULH_R;
+                    end
+                    SS_ISMULH_R: begin
+                        alu_opcode <= ALU_ISMULH_R;
+                    end
+                    SS_IMUL_RCP: begin
+                        // multiply by reciprocal(imm32) — compute it first
+                        alu_opcode  <= ALU_IMUL_R;
+                        rcp_divisor <= ss_imm_zx;
+                        rcp_rem     <= 65'b0;
+                        rcp_quot    <= 64'b0;
+                        rcp_first   <= 1'b1;
+                        state       <= ST_RCP;
+                    end
+                    default: begin
+                        // unknown opcode behaves as a NOP (dst unchanged)
+                        alu_opcode <= 6'd63;
+                    end
+                endcase
             end
 
+            // -----------------------------------------------------------
+            // Reciprocal computation: one restoring-division step per cycle
+            // -----------------------------------------------------------
+            ST_RCP: begin
+                if (rcp_first) begin
+                    // first cycle: bsr of the freshly loaded divisor is valid
+                    if (rcp_divisor == 64'b0) begin
+                        // division by zero cannot happen in valid programs
+                        alu_src_b <= 64'b0;
+                        state     <= ST_ISSUE;
+                    end else begin
+                        rcp_cnt   <= {2'b0, rcp_bsr} + 8'd63; // 64+bsr-1 more steps
+                        rcp_first <= 1'b0;
+                        rcp_rem   <= rcp_ge ? (rcp_rem_shift - {1'b0, rcp_divisor})
+                                            : rcp_rem_shift;
+                        rcp_quot  <= {rcp_quot[62:0], rcp_ge};
+                    end
+                end else begin
+                    rcp_rem  <= rcp_ge ? (rcp_rem_shift - {1'b0, rcp_divisor})
+                                       : rcp_rem_shift;
+                    rcp_quot <= {rcp_quot[62:0], rcp_ge};
+                    if (rcp_cnt == 8'd1) begin
+                        alu_src_b <= {rcp_quot[62:0], rcp_ge};
+                        state     <= ST_ISSUE;
+                    end else begin
+                        rcp_cnt <= rcp_cnt - 8'd1;
+                    end
+                end
+            end
+
+            // -----------------------------------------------------------
+            ST_ISSUE: begin
+                alu_en <= 1'b1;
+                state  <= ST_WB;
+            end
+
+            // -----------------------------------------------------------
+            // Writeback: alu_int registers its output, wait for result_valid
+            // -----------------------------------------------------------
+            ST_WB: begin
+                if (alu_valid) begin
+                    rf[wb_dst] <= alu_result;
+                    state      <= ST_FETCH;
+                end
+            end
+
+            // -----------------------------------------------------------
             ST_DONE: begin
                 out_r0 <= rf[0]; out_r1 <= rf[1];
                 out_r2 <= rf[2]; out_r3 <= rf[3];
                 out_r4 <= rf[4]; out_r5 <= rf[5];
                 out_r6 <= rf[6]; out_r7 <= rf[7];
                 done   <= 1'b1;
+                busy   <= 1'b0;
                 state  <= ST_IDLE;
             end
 

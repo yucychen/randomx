@@ -18,7 +18,7 @@ randomx/
 │   ├── aes_gen1r.v         # AesGenerator1R（1轮AES × 4 lane）
 │   ├── aes_gen4r.v         # AesGenerator4R（4轮AES × 4 lane）
 │   ├── aes_hash1r.v        # AesHash1R（4轮AES哈希 × 4 lane）
-│   ├── superscalar_hash.v  # SuperscalarHash（数据集生成程序执行骨架）
+│   ├── superscalar_hash.v  # SuperscalarHash（数据集生成程序执行单元）
 │   ├── randomx_vm.v        # RandomX 虚拟机（取指/译码/执行/回写）
 │   ├── alu_int.v           # 整数执行单元（19条整数指令）
 │   ├── fpu_double.v        # 双精度浮点单元骨架（FSCAL/FSWAP 已实现）
@@ -27,7 +27,8 @@ randomx/
 │   └── argon2_fill.v       # Argon2d Cache 填充骨架（基于 Blake2b）
 ├── sim/
 │   ├── tb_randomx_top.v    # 基础功能仿真 testbench
-│   └── tb_blake2b.v        # Blake2b-512 RFC 7693 测试向量 testbench
+│   ├── tb_blake2b.v        # Blake2b-512 RFC 7693 测试向量 testbench
+│   └── tb_superscalar_hash.v # SuperscalarHash 全指令集 testbench
 ├── vivado/
 │   ├── build.tcl           # Vivado TCL 构建脚本（非项目模式）
 │   └── constraints.xdc     # 时序约束（300 MHz 时钟 + HBM 占位符）
@@ -164,10 +165,17 @@ randomx/
 - FADD/FSUB/FMUL：**TODO** — 需要 IEEE 754 加法器/乘法器
 - FDIV/FSQRT：**TODO** — 需要迭代除法/开方单元
 
-### `superscalar_hash.v` — SuperscalarHash 骨架
-- 程序缓冲区（4096 × 64-bit）
-- 简单顺序执行 FSM（取指→译码→执行→回写）
-- **TODO**：超标量调度（并行执行端口）
+### `superscalar_hash.v` — SuperscalarHash 执行单元（**已实现**）
+- 程序缓冲区（4096 × 64-bit），指令编码：
+  `[63:56]=opcode [55:53]=dst [52:50]=src [49:48]=mod_shift [31:0]=imm32`
+- 完整指令集（规范 §6.2）：ISUB_R、IXOR_R、IADD_RS、IMUL_R、IROR_C、
+  IADD_C7/C8/C9、IXOR_C7/C8/C9、IMULH_R、ISMULH_R、IMUL_RCP
+- 顺序执行 FSM（取指→译码→发射→回写），每条指令写回后再取下一条，
+  消除寄存器 RAW/WAW 冒险
+- IMUL_RCP 倒数单元：逐位恢复余数除法，计算 `floor(2^(63+bsr)/imm32)`
+  （与 `reciprocal.c` 位级一致），耗时 64+bsr(imm32) 周期
+- 单元测试：`sim/tb_superscalar_hash.v`（覆盖全部 14 种指令，比对软件模型结果）
+- **TODO**：超标量调度（并行执行端口，仅影响吞吐量，结果不变）
 
 ### `argon2_fill.v` — Argon2d Cache 填充骨架
 - 状态机：IDLE → H0 → INIT_BLK → FILL → COMPRESS → WRITE → DONE
@@ -250,6 +258,11 @@ vvp sim/tb_randomx_top.vvp
 iverilog -g2001 -o sim/tb_blake2b.vvp rtl/blake2b_core.v sim/tb_blake2b.v
 vvp sim/tb_blake2b.vvp   # 输出 PASS
 
+# SuperscalarHash 单元测试（全指令集，比对软件模型）
+iverilog -g2001 -o sim/tb_superscalar_hash.vvp \
+    rtl/alu_int.v rtl/superscalar_hash.v sim/tb_superscalar_hash.v
+vvp sim/tb_superscalar_hash.vvp   # 输出 PASS
+
 # 查看波形（需安装 GTKWave）
 gtkwave tb_randomx_top.vcd
 ```
@@ -284,7 +297,7 @@ done
 | hbm_dataset_if.v | **已实现** | 连接 HBM IP、写接口接到 superscalar_hash    |
 | alu_int.v        | 骨架       | IMUL_RCP（倒数计算）、CBRANCH 条件掩码     |
 | fpu_double.v     | 骨架       | FADD/FSUB/FMUL（IEEE 754）、FDIV/FSQRT   |
-| superscalar_hash.v| 骨架      | 超标量调度、完整指令集编码                   |
+| superscalar_hash.v| **已实现** | 超标量调度（并行执行端口，性能优化）        |
 | randomx_vm.v     | 骨架       | 完整指令译码、内存地址计算、CFROUND         |
 | argon2_fill.v    | 骨架       | G 函数、数据相关参考块选择、多轮支持         |
 
