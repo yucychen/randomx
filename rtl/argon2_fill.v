@@ -49,11 +49,13 @@ module argon2_fill (
 
     // Blake2b interface (single shared core instance)
     output reg           b2b_start,
+    output reg           b2b_init,      // let the core generate the Blake2b IV
     output reg  [1023:0] b2b_msg,
     output reg  [127:0]  b2b_byte_cnt,
     output reg  [511:0]  b2b_h_in,
     output reg           b2b_last,
     input  wire [511:0]  b2b_h_out,
+    input  wire          b2b_busy,
     input  wire          b2b_done
 );
 
@@ -106,6 +108,7 @@ always @(posedge clk or negedge rst_n) begin
         cache_wr_addr  <= 32'b0;
         cache_wr_data  <= 1024'b0;
         b2b_start      <= 1'b0;
+        b2b_init       <= 1'b0;
         b2b_msg        <= 1024'b0;
         b2b_byte_cnt   <= 128'b0;
         b2b_h_in       <= 512'b0;
@@ -124,7 +127,8 @@ always @(posedge clk or negedge rst_n) begin
                     // TODO: Pack Argon2d parameter block into msg
                     b2b_msg      <= {key, 512'b0}; // placeholder packing
                     b2b_byte_cnt <= {122'b0, key_len};
-                    b2b_h_in     <= 512'b0;        // IV will be set inside blake2b_core
+                    b2b_h_in     <= 512'b0;        // unused: core starts from its own IV
+                    b2b_init     <= 1'b1;          // IV generated inside blake2b_core
                     b2b_last     <= 1'b1;
                     b2b_start    <= 1'b1;
                     block_idx    <= 18'd0;
@@ -179,6 +183,7 @@ always @(posedge clk or negedge rst_n) begin
                 // TODO: Drive Blake2b to compress current block
                 // Blake2b here acts as a PRF over the block
                 b2b_msg      <= cur_block;
+                b2b_init     <= 1'b0;
                 b2b_h_in     <= h0;
                 b2b_byte_cnt <= 128'd1024;
                 b2b_last     <= 1'b1;

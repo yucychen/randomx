@@ -1,5 +1,5 @@
 // =============================================================================
-// blake2b_core.v — Blake2b-512 hash core skeleton
+// blake2b_core.v — Blake2b-512 compression core
 // Part of RandomX FPGA framework targeting Xilinx XCVU33P
 //
 // Blake2b-512 is used for:
@@ -8,20 +8,35 @@
 //   - Final output hash
 //
 // Implements the complete compression function F:
-//   full sigma message schedule, 12 rounds × 8 G-calls (1 G-call per cycle),
+//   full sigma message schedule, 12 rounds, 4 G-functions evaluated in
+//   parallel per cycle (one half-round per cycle → 24 cycles per block),
 //   finalization h[i] ^= v[i] ^ v[i+8].
-// Verified against RFC 7693 test vector (Blake2b-512 of "abc").
+// Verified against the RFC 7693 test vectors.
+//
+// Usage:
+//   - Assert `start` for one cycle together with `msg_block`, `byte_count`
+//     (total bytes hashed *including* this block) and `last_block`.
+//   - `h_in` supplies the incoming chaining value. Assert `init` instead to
+//     let the core start from the Blake2b parameter block IV
+//     (unkeyed, digest length = DIGEST_BYTES, fanout = depth = 1); `h_in` is
+//     then ignored, which allows a single-block message to be hashed without
+//     the caller having to know the IV.
+//   - `busy` is high while a compression is in flight; `start` is ignored
+//     while busy. `done` pulses for one cycle when `h_out` is valid.
 //
 // Verilog-2001 compliant, no vendor IP.
 // =============================================================================
 
 `timescale 1ns/1ps
 
-module blake2b_core (
+module blake2b_core #(
+    parameter DIGEST_BYTES = 64   // digest length used for the parameter block
+) (
     input  wire          clk,
     input  wire          rst_n,
     // Control
-    input  wire          start,        // Begin compression
+    input  wire          start,        // Begin compression (ignored while busy)
+    input  wire          init,         // Start from parameter-block IV (h_in ignored)
     input  wire          last_block,   // Final block flag (sets f0 = ~0)
     // Message block: 16 × 64-bit words (1024 bits)
     input  wire [1023:0] msg_block,
@@ -31,8 +46,9 @@ module blake2b_core (
     input  wire [511:0]  h_in,
     // Output chaining values after compression
     output reg  [511:0]  h_out,
-    // Done pulse
-    output reg           done
+    // Status
+    output wire          busy,         // High while a compression is running
+    output reg           done          // One-cycle pulse when h_out is valid
 );
 
 // ---------------------------------------------------------------------------
@@ -46,6 +62,11 @@ localparam [63:0] IV4 = 64'h510e527fade682d1;
 localparam [63:0] IV5 = 64'h9b05688c2b3e6c1f;
 localparam [63:0] IV6 = 64'h1f83d9abfb41bd6b;
 localparam [63:0] IV7 = 64'h5be0cd19137e2179;
+
+// Parameter block for an unkeyed hash: digest_length | key_length=0 |
+// fanout=1 | depth=1, all other fields zero.
+localparam [63:0] PARAM0 = 64'h0000000001010000 | DIGEST_BYTES;
+localparam [63:0] H_INIT0 = IV0 ^ PARAM0;
 
 // ---------------------------------------------------------------------------
 // Blake2b sigma permutation lookup — round r, position p → message index
@@ -114,171 +135,237 @@ function [3:0] sigma;
 endfunction
 
 // ---------------------------------------------------------------------------
-// Working state vector v[0..15] (16 × 64-bit)
+// Working state vector v[0..15], chaining value h[0..7], message m[0..15]
 // ---------------------------------------------------------------------------
 reg [63:0] v0,  v1,  v2,  v3,  v4,  v5,  v6,  v7;
 reg [63:0] v8,  v9,  v10, v11, v12, v13, v14, v15;
 reg [63:0] h0,  h1,  h2,  h3,  h4,  h5,  h6,  h7;
-reg [63:0] m0,  m1,  m2,  m3,  m4,  m5,  m6,  m7;
-reg [63:0] m8,  m9,  m10, m11, m12, m13, m14, m15;
+reg [1023:0] m;   // message block, 16 x 64-bit little-endian words
 
-// Round counter (0..11) and G-call step within round (0..7)
+// Round counter (0..11) and half-round select (0 = columns, 1 = diagonals)
 reg [3:0] round;
-reg [2:0] step;
-reg       busy;
+reg       half;
+reg       busy_r;
+
+assign busy = busy_r;
 
 // ---------------------------------------------------------------------------
-// G-function: a = v[a_idx] etc. — combinational for one G-call per cycle
-// G(va, vb, vc, vd, mx, my):
-//   va = va + vb + mx
-//   vd = ror64(vd ^ va, 32)
-//   vc = vc + vd
-//   vb = ror64(vb ^ vc, 24)
-//   va = va + vb + my
-//   vd = ror64(vd ^ va, 16)
-//   vc = vc + vd
-//   vb = ror64(vb ^ vc, 63)
+// Message word selection.
+// The block is kept as a single vector so that the words can be selected with
+// an indexed part-select; a function call inside a continuous assignment would
+// only be re-evaluated when its explicit arguments change.
 // ---------------------------------------------------------------------------
-// G-call operand selection per step (column steps 0-3, diagonal steps 4-7):
-//   step 0: (v0,v4,v8, v12)   step 4: (v0,v5,v10,v15)
-//   step 1: (v1,v5,v9, v13)   step 5: (v1,v6,v11,v12)
-//   step 2: (v2,v6,v10,v14)   step 6: (v2,v7,v8, v13)
-//   step 3: (v3,v7,v11,v15)   step 7: (v3,v4,v9, v14)
-reg [63:0] gva_in, gvb_in, gvc_in, gvd_in, gmx, gmy;
-wire [63:0] gva_out, gvb_out, gvc_out, gvd_out;
+// Half-round message positions: columns use sigma positions 0..7,
+// diagonals use positions 8..15.
+wire [3:0] pos0 = {half, 3'd0};
+wire [3:0] pos1 = {half, 3'd1};
+wire [3:0] pos2 = {half, 3'd2};
+wire [3:0] pos3 = {half, 3'd3};
+wire [3:0] pos4 = {half, 3'd4};
+wire [3:0] pos5 = {half, 3'd5};
+wire [3:0] pos6 = {half, 3'd6};
+wire [3:0] pos7 = {half, 3'd7};
 
-// Message word selection: mx = m[sigma(round, 2*step)], my = m[sigma(round, 2*step+1)]
-wire [3:0] mx_idx = sigma(round, {step, 1'b0});
-wire [3:0] my_idx = sigma(round, {step, 1'b1});
+wire [9:0] mo0 = {sigma(round, pos0), 6'b0};   // word index * 64
+wire [9:0] mo1 = {sigma(round, pos1), 6'b0};
+wire [9:0] mo2 = {sigma(round, pos2), 6'b0};
+wire [9:0] mo3 = {sigma(round, pos3), 6'b0};
+wire [9:0] mo4 = {sigma(round, pos4), 6'b0};
+wire [9:0] mo5 = {sigma(round, pos5), 6'b0};
+wire [9:0] mo6 = {sigma(round, pos6), 6'b0};
+wire [9:0] mo7 = {sigma(round, pos7), 6'b0};
 
-function [63:0] msel;
-    input [3:0] idx;
-    case (idx)
-        4'd0:  msel = m0;  4'd1:  msel = m1;  4'd2:  msel = m2;  4'd3:  msel = m3;
-        4'd4:  msel = m4;  4'd5:  msel = m5;  4'd6:  msel = m6;  4'd7:  msel = m7;
-        4'd8:  msel = m8;  4'd9:  msel = m9;  4'd10: msel = m10; 4'd11: msel = m11;
-        4'd12: msel = m12; 4'd13: msel = m13; 4'd14: msel = m14; 4'd15: msel = m15;
-    endcase
-endfunction
-
-always @(*) begin
-    gmx = msel(mx_idx);
-    gmy = msel(my_idx);
-    case (step)
-        3'd0: begin gva_in = v0; gvb_in = v4; gvc_in = v8;  gvd_in = v12; end
-        3'd1: begin gva_in = v1; gvb_in = v5; gvc_in = v9;  gvd_in = v13; end
-        3'd2: begin gva_in = v2; gvb_in = v6; gvc_in = v10; gvd_in = v14; end
-        3'd3: begin gva_in = v3; gvb_in = v7; gvc_in = v11; gvd_in = v15; end
-        3'd4: begin gva_in = v0; gvb_in = v5; gvc_in = v10; gvd_in = v15; end
-        3'd5: begin gva_in = v1; gvb_in = v6; gvc_in = v11; gvd_in = v12; end
-        3'd6: begin gva_in = v2; gvb_in = v7; gvc_in = v8;  gvd_in = v13; end
-        3'd7: begin gva_in = v3; gvb_in = v4; gvc_in = v9;  gvd_in = v14; end
-    endcase
-end
-
-// G-function intermediate signals (Verilog-2001: no bit-select on expressions)
-wire [63:0] g_t0_a    = gva_in + gvb_in + gmx;
-wire [63:0] g_t0_d_xr = gvd_in ^ g_t0_a;
-wire [63:0] g_t0_d    = {g_t0_d_xr[31:0], g_t0_d_xr[63:32]};      // ror32
-wire [63:0] g_t0_c    = gvc_in + g_t0_d;
-wire [63:0] g_t0_b_xr = gvb_in ^ g_t0_c;
-wire [63:0] g_t0_b    = {g_t0_b_xr[23:0], g_t0_b_xr[63:24]};      // ror24
-wire [63:0] g_t1_a    = g_t0_a + g_t0_b + gmy;
-wire [63:0] g_t1_d_xr = g_t0_d ^ g_t1_a;
-wire [63:0] g_t1_d    = {g_t1_d_xr[15:0], g_t1_d_xr[63:16]};      // ror16
-wire [63:0] g_t1_c    = g_t0_c + g_t1_d;
-wire [63:0] g_t1_b_xr = g_t0_b ^ g_t1_c;
-// ror63 = rotate right by 63 = rotate left by 1 = {x[62:0], x[63]}
-wire [63:0] g_t1_b    = {g_t1_b_xr[62:0], g_t1_b_xr[63]};         // ror63
-
-assign gva_out = g_t1_a;
-assign gvb_out = g_t1_b;
-assign gvc_out = g_t1_c;
-assign gvd_out = g_t1_d;
+wire [63:0] gm0 = m[mo0 +: 64];
+wire [63:0] gm1 = m[mo1 +: 64];
+wire [63:0] gm2 = m[mo2 +: 64];
+wire [63:0] gm3 = m[mo3 +: 64];
+wire [63:0] gm4 = m[mo4 +: 64];
+wire [63:0] gm5 = m[mo5 +: 64];
+wire [63:0] gm6 = m[mo6 +: 64];
+wire [63:0] gm7 = m[mo7 +: 64];
 
 // ---------------------------------------------------------------------------
-// FSM
+// Four parallel G-functions.
+//   columns  (half = 0): G(v0,v4,v8, v12) G(v1,v5,v9, v13)
+//                        G(v2,v6,v10,v14) G(v3,v7,v11,v15)
+//   diagonals(half = 1): G(v0,v5,v10,v15) G(v1,v6,v11,v12)
+//                        G(v2,v7,v8, v13) G(v3,v4,v9, v14)
+// ---------------------------------------------------------------------------
+wire [63:0] a0_in = v0;
+wire [63:0] a1_in = v1;
+wire [63:0] a2_in = v2;
+wire [63:0] a3_in = v3;
+wire [63:0] b0_in = half ? v5 : v4;
+wire [63:0] b1_in = half ? v6 : v5;
+wire [63:0] b2_in = half ? v7 : v6;
+wire [63:0] b3_in = half ? v4 : v7;
+wire [63:0] c0_in = half ? v10 : v8;
+wire [63:0] c1_in = half ? v11 : v9;
+wire [63:0] c2_in = half ? v8  : v10;
+wire [63:0] c3_in = half ? v9  : v11;
+wire [63:0] d0_in = half ? v15 : v12;
+wire [63:0] d1_in = half ? v12 : v13;
+wire [63:0] d2_in = half ? v13 : v14;
+wire [63:0] d3_in = half ? v14 : v15;
+
+wire [63:0] a0_out, b0_out, c0_out, d0_out;
+wire [63:0] a1_out, b1_out, c1_out, d1_out;
+wire [63:0] a2_out, b2_out, c2_out, d2_out;
+wire [63:0] a3_out, b3_out, c3_out, d3_out;
+
+blake2b_g u_g0 (
+    .a_in (a0_in), .b_in (b0_in), .c_in (c0_in), .d_in (d0_in),
+    .mx   (gm0),   .my   (gm1),
+    .a_out(a0_out),.b_out(b0_out),.c_out(c0_out),.d_out(d0_out)
+);
+blake2b_g u_g1 (
+    .a_in (a1_in), .b_in (b1_in), .c_in (c1_in), .d_in (d1_in),
+    .mx   (gm2),   .my   (gm3),
+    .a_out(a1_out),.b_out(b1_out),.c_out(c1_out),.d_out(d1_out)
+);
+blake2b_g u_g2 (
+    .a_in (a2_in), .b_in (b2_in), .c_in (c2_in), .d_in (d2_in),
+    .mx   (gm4),   .my   (gm5),
+    .a_out(a2_out),.b_out(b2_out),.c_out(c2_out),.d_out(d2_out)
+);
+blake2b_g u_g3 (
+    .a_in (a3_in), .b_in (b3_in), .c_in (c3_in), .d_in (d3_in),
+    .mx   (gm6),   .my   (gm7),
+    .a_out(a3_out),.b_out(b3_out),.c_out(c3_out),.d_out(d3_out)
+);
+
+// Next working-vector values for the current half-round
+wire [63:0] v0_nxt = a0_out;
+wire [63:0] v1_nxt = a1_out;
+wire [63:0] v2_nxt = a2_out;
+wire [63:0] v3_nxt = a3_out;
+wire [63:0] v4_nxt  = half ? b3_out : b0_out;
+wire [63:0] v5_nxt  = half ? b0_out : b1_out;
+wire [63:0] v6_nxt  = half ? b1_out : b2_out;
+wire [63:0] v7_nxt  = half ? b2_out : b3_out;
+wire [63:0] v8_nxt  = half ? c2_out : c0_out;
+wire [63:0] v9_nxt  = half ? c3_out : c1_out;
+wire [63:0] v10_nxt = half ? c0_out : c2_out;
+wire [63:0] v11_nxt = half ? c1_out : c3_out;
+wire [63:0] v12_nxt = half ? d1_out : d0_out;
+wire [63:0] v13_nxt = half ? d2_out : d1_out;
+wire [63:0] v14_nxt = half ? d3_out : d2_out;
+wire [63:0] v15_nxt = half ? d0_out : d3_out;
+
+// Chaining value after the final half-round of the last round
+wire [511:0] h_final = {
+    h7 ^ v7_nxt ^ v15_nxt,
+    h6 ^ v6_nxt ^ v14_nxt,
+    h5 ^ v5_nxt ^ v13_nxt,
+    h4 ^ v4_nxt ^ v12_nxt,
+    h3 ^ v3_nxt ^ v11_nxt,
+    h2 ^ v2_nxt ^ v10_nxt,
+    h1 ^ v1_nxt ^ v9_nxt,
+    h0 ^ v0_nxt ^ v8_nxt
+};
+
+// Starting chaining value: either supplied by the caller or the parameter IV
+wire [511:0] h_start = init ? {IV7, IV6, IV5, IV4, IV3, IV2, IV1, H_INIT0} : h_in;
+
+// ---------------------------------------------------------------------------
+// FSM: 12 rounds × 2 half-rounds = 24 cycles per block
 // ---------------------------------------------------------------------------
 always @(posedge clk or negedge rst_n) begin
     if (!rst_n) begin
         {v0,v1,v2,v3,v4,v5,v6,v7,v8,v9,v10,v11,v12,v13,v14,v15} <= {16{64'b0}};
-        {h0,h1,h2,h3,h4,h5,h6,h7}                                 <= {8{64'b0}};
-        {m0,m1,m2,m3,m4,m5,m6,m7,m8,m9,m10,m11,m12,m13,m14,m15} <= {16{64'b0}};
+        {h0,h1,h2,h3,h4,h5,h6,h7}                               <= {8{64'b0}};
+        m      <= 1024'b0;
         round  <= 4'd0;
-        step   <= 3'd0;
-        busy   <= 1'b0;
+        half   <= 1'b0;
+        busy_r <= 1'b0;
         h_out  <= 512'b0;
         done   <= 1'b0;
     end else begin
         done <= 1'b0;
 
-        if (start) begin
-            // Latch h_in
-            h0 <= h_in[ 63:  0]; h1 <= h_in[127: 64];
-            h2 <= h_in[191:128]; h3 <= h_in[255:192];
-            h4 <= h_in[319:256]; h5 <= h_in[383:320];
-            h6 <= h_in[447:384]; h7 <= h_in[511:448];
+        if (start && !busy_r) begin
+            // Latch the incoming chaining value
+            h0 <= h_start[ 63:  0]; h1 <= h_start[127: 64];
+            h2 <= h_start[191:128]; h3 <= h_start[255:192];
+            h4 <= h_start[319:256]; h5 <= h_start[383:320];
+            h6 <= h_start[447:384]; h7 <= h_start[511:448];
             // Latch message words
-            m0  <= msg_block[ 63:  0]; m1  <= msg_block[127: 64];
-            m2  <= msg_block[191:128]; m3  <= msg_block[255:192];
-            m4  <= msg_block[319:256]; m5  <= msg_block[383:320];
-            m6  <= msg_block[447:384]; m7  <= msg_block[511:448];
-            m8  <= msg_block[575:512]; m9  <= msg_block[639:576];
-            m10 <= msg_block[703:640]; m11 <= msg_block[767:704];
-            m12 <= msg_block[831:768]; m13 <= msg_block[895:832];
-            m14 <= msg_block[959:896]; m15 <= msg_block[1023:960];
+            m <= msg_block;
             // Init working vector v[0..7] = h[0..7]
-            v0  <= h_in[ 63:  0]; v1  <= h_in[127: 64];
-            v2  <= h_in[191:128]; v3  <= h_in[255:192];
-            v4  <= h_in[319:256]; v5  <= h_in[383:320];
-            v6  <= h_in[447:384]; v7  <= h_in[511:448];
-            // v[8..15] = IV; v12 ^= t0; v13 ^= t1; v14 ^= finalization
+            v0  <= h_start[ 63:  0]; v1  <= h_start[127: 64];
+            v2  <= h_start[191:128]; v3  <= h_start[255:192];
+            v4  <= h_start[319:256]; v5  <= h_start[383:320];
+            v6  <= h_start[447:384]; v7  <= h_start[511:448];
+            // v[8..15] = IV; v12 ^= t0; v13 ^= t1; v14 ^= finalization flag
             v8  <= IV0; v9  <= IV1; v10 <= IV2; v11 <= IV3;
             v12 <= IV4 ^ byte_count[63:0];
             v13 <= IV5 ^ byte_count[127:64];
             v14 <= last_block ? (IV6 ^ 64'hffffffffffffffff) : IV6;
             v15 <= IV7;
-            round <= 4'd0;
-            step  <= 3'd0;
-            busy  <= 1'b1;
-        end else if (busy) begin
-            // One G-call per cycle: write G outputs back to the selected v regs
-            case (step)
-                3'd0: begin v0 <= gva_out; v4 <= gvb_out; v8  <= gvc_out; v12 <= gvd_out; end
-                3'd1: begin v1 <= gva_out; v5 <= gvb_out; v9  <= gvc_out; v13 <= gvd_out; end
-                3'd2: begin v2 <= gva_out; v6 <= gvb_out; v10 <= gvc_out; v14 <= gvd_out; end
-                3'd3: begin v3 <= gva_out; v7 <= gvb_out; v11 <= gvc_out; v15 <= gvd_out; end
-                3'd4: begin v0 <= gva_out; v5 <= gvb_out; v10 <= gvc_out; v15 <= gvd_out; end
-                3'd5: begin v1 <= gva_out; v6 <= gvb_out; v11 <= gvc_out; v12 <= gvd_out; end
-                3'd6: begin v2 <= gva_out; v7 <= gvb_out; v8  <= gvc_out; v13 <= gvd_out; end
-                3'd7: begin v3 <= gva_out; v4 <= gvb_out; v9  <= gvc_out; v14 <= gvd_out; end
-            endcase
+            round  <= 4'd0;
+            half   <= 1'b0;
+            busy_r <= 1'b1;
+        end else if (busy_r) begin
+            // One half-round (4 G-functions) per cycle
+            v0  <= v0_nxt;  v1  <= v1_nxt;  v2  <= v2_nxt;  v3  <= v3_nxt;
+            v4  <= v4_nxt;  v5  <= v5_nxt;  v6  <= v6_nxt;  v7  <= v7_nxt;
+            v8  <= v8_nxt;  v9  <= v9_nxt;  v10 <= v10_nxt; v11 <= v11_nxt;
+            v12 <= v12_nxt; v13 <= v13_nxt; v14 <= v14_nxt; v15 <= v15_nxt;
 
-            if (step == 3'd7) begin
-                step  <= 3'd0;
+            if (!half) begin
+                half <= 1'b1;
+            end else begin
+                half <= 1'b0;
                 if (round == 4'd11) begin
                     // Finalize: h_out[i] = h[i] ^ v[i] ^ v[i+8]
-                    // Step 7 updates v3,v4,v9,v14 — use G outputs for those
-                    busy  <= 1'b0;
-                    done  <= 1'b1;
-                    h_out <= {
-                        h7 ^ v7      ^ v15,
-                        h6 ^ v6      ^ gvd_out,   // v14
-                        h5 ^ v5      ^ v13,
-                        h4 ^ gvb_out ^ v12,       // v4
-                        h3 ^ gva_out ^ v11,       // v3
-                        h2 ^ v2      ^ v10,
-                        h1 ^ v1      ^ gvc_out,   // v9
-                        h0 ^ v0      ^ v8
-                    };
+                    busy_r <= 1'b0;
+                    done   <= 1'b1;
+                    h_out  <= h_final;
                 end else begin
                     round <= round + 4'd1;
                 end
-            end else begin
-                step <= step + 3'd1;
             end
         end
     end
 end
+
+endmodule
+
+// =============================================================================
+// blake2b_g — Blake2b mixing function G (purely combinational)
+//   a = a + b + mx;  d = ror64(d ^ a, 32);  c = c + d;  b = ror64(b ^ c, 24)
+//   a = a + b + my;  d = ror64(d ^ a, 16);  c = c + d;  b = ror64(b ^ c, 63)
+// =============================================================================
+module blake2b_g (
+    input  wire [63:0] a_in,
+    input  wire [63:0] b_in,
+    input  wire [63:0] c_in,
+    input  wire [63:0] d_in,
+    input  wire [63:0] mx,
+    input  wire [63:0] my,
+    output wire [63:0] a_out,
+    output wire [63:0] b_out,
+    output wire [63:0] c_out,
+    output wire [63:0] d_out
+);
+
+// Verilog-2001: no bit-select on expressions, so name every intermediate
+wire [63:0] t0_a    = a_in + b_in + mx;
+wire [63:0] t0_d_xr = d_in ^ t0_a;
+wire [63:0] t0_d    = {t0_d_xr[31:0], t0_d_xr[63:32]};   // ror 32
+wire [63:0] t0_c    = c_in + t0_d;
+wire [63:0] t0_b_xr = b_in ^ t0_c;
+wire [63:0] t0_b    = {t0_b_xr[23:0], t0_b_xr[63:24]};   // ror 24
+wire [63:0] t1_a    = t0_a + t0_b + my;
+wire [63:0] t1_d_xr = t0_d ^ t1_a;
+wire [63:0] t1_d    = {t1_d_xr[15:0], t1_d_xr[63:16]};   // ror 16
+wire [63:0] t1_c    = t0_c + t1_d;
+wire [63:0] t1_b_xr = t0_b ^ t1_c;
+wire [63:0] t1_b    = {t1_b_xr[62:0], t1_b_xr[63]};      // ror 63
+
+assign a_out = t1_a;
+assign b_out = t1_b;
+assign c_out = t1_c;
+assign d_out = t1_d;
 
 endmodule

@@ -2,8 +2,11 @@
 
 面向 Xilinx Virtex UltraScale+ **XCVU33P**（型号：`xcvu33p-fsvh2104-2L-e`）的 RandomX 工作量证明算法纯 Verilog-2001 硬件实现框架。
 
-> **状态：骨架/框架**  
-> 所有模块均可使用 `iverilog -g2001` 编译并通过仿真，功能逻辑已标注 `TODO` 注释，待完整实现。
+> **状态：部分实现**  
+> 所有模块均可使用 `iverilog -g2001` 编译并通过仿真。
+> `blake2b_core` / `aes_round` / `scratchpad_mem` / `hbm_dataset_if` / `superscalar_hash`
+> 已完整实现并有单元测试覆盖（见 [单元测试状态](#单元测试状态)）；
+> 其余模块为骨架，功能逻辑以 `TODO` 注释标注，待完整实现。
 
 ---
 
@@ -13,21 +16,24 @@
 randomx/
 ├── rtl/                    # RTL 源码（纯 Verilog-2001）
 │   ├── randomx_top.v       # 顶层模块：时钟/复位、寄存器接口、主 FSM
-│   ├── blake2b_core.v      # Blake2b-512 哈希核（完整 12 轮压缩，已验证）
+│   ├── blake2b_core.v      # Blake2b-512 压缩核（12 轮，4 路并行 G，24 周期/块）
+│   │                       #   含 blake2b_g 子模块（G 混合函数，纯组合）
 │   ├── aes_round.v         # AES 单轮函数（SubBytes/ShiftRows/MixColumns/ARK）
 │   ├── aes_gen1r.v         # AesGenerator1R（1轮AES × 4 lane）
 │   ├── aes_gen4r.v         # AesGenerator4R（4轮AES × 4 lane）
 │   ├── aes_hash1r.v        # AesHash1R（4轮AES哈希 × 4 lane）
-│   ├── superscalar_hash.v  # SuperscalarHash（数据集生成程序执行骨架）
+│   ├── superscalar_hash.v  # SuperscalarHash（数据集生成程序执行单元）
 │   ├── randomx_vm.v        # RandomX 虚拟机（取指/译码/执行/回写）
 │   ├── alu_int.v           # 整数执行单元（19条整数指令）
 │   ├── fpu_double.v        # 双精度浮点单元骨架（FSCAL/FSWAP 已实现）
 │   ├── scratchpad_mem.v    # 2 MiB Scratchpad（URAM 推断，L1/L2/L3 掩码）
-│   ├── hbm_dataset_if.v    # HBM2 AXI4 主设备接口骨架（数据集访问）
+│   ├── hbm_dataset_if.v    # HBM2 AXI4 主设备接口（数据集读写，流水化）
 │   └── argon2_fill.v       # Argon2d Cache 填充骨架（基于 Blake2b）
 ├── sim/
 │   ├── tb_randomx_top.v    # 基础功能仿真 testbench
-│   └── tb_blake2b.v        # Blake2b-512 RFC 7693 测试向量 testbench
+│   ├── tb_blake2b.v        # Blake2b-512 参考测试向量 testbench（含多块/busy）
+│   ├── tb_hbm_dataset_if.v # HBM AXI4 接口 testbench（含 AXI 从设备模型）
+│   └── tb_superscalar_hash.v # SuperscalarHash 全指令集 testbench
 ├── vivado/
 │   ├── build.tcl           # Vivado TCL 构建脚本（非项目模式）
 │   └── constraints.xdc     # 时序约束（300 MHz 时钟 + HBM 占位符）
@@ -116,15 +122,20 @@ randomx/
   |---------|------|-----------------------------|
   | 0x00~0x3C | 写  | 种子输入（512位，16×32位）   |
   | 0x40    | 写   | 控制寄存器（bit0=start）      |
-  | 0x44    | 读   | 状态寄存器（bit0=done/~busy） |
+  | 0x44    | 读   | 状态寄存器（bit0=done/~busy，bit1=HBM AXI 错误粘滞位） |
   | 0x48~0x84 | 读 | 哈希输出（512位，16×32位）   |
 - **主 FSM**：IDLE → CACHE_INIT → VM_RUN → FINAL_HASH → DONE
 - **TODO**：DS_GEN 阶段、完整 AXI-Lite 握手
 
-### `blake2b_core.v` — Blake2b-512 哈希核（**已完成**）
-- G 函数数据通路（rotr32/rotr24/rotr16/rotr63）
-- 完整 sigma 置换表（12 轮）与 G 函数逐步调度（每周期 1 次 G 调用，约96周期/压缩）
-- 已通过 RFC 7693 测试向量验证（`sim/tb_blake2b.v`）
+### `blake2b_core.v` — Blake2b-512 压缩核（**已完成**）
+- `blake2b_g` 子模块：G 函数组合数据通路（rotr32/rotr24/rotr16/rotr63）
+- 完整 sigma 置换表（12 轮）；每周期并行执行 4 个 G 函数（1 个半轮），
+  共 **24 周期/压缩**（列半轮 + 对角半轮 × 12 轮）
+- `init` 输入：由核内部生成 Blake2b 参数块初始链值
+  （无密钥，摘要长度由参数 `DIGEST_BYTES` 指定，默认 64 字节），此时忽略 `h_in`
+- `busy` 输出：压缩进行中为高；`busy` 期间的 `start` 被忽略，防止状态被破坏
+- 已通过参考测试向量验证（`sim/tb_blake2b.v`）：
+  `"abc"`（外部 IV / `init` 两种方式）、空消息、200 字节两块链式哈希、`busy` 握手
 
 ### `aes_round.v` — AES 单轮函数
 - SubBytes：256 项 LUT S-box（纯组合逻辑）
@@ -146,9 +157,18 @@ randomx/
 
 ### `hbm_dataset_if.v` — HBM2 数据集 AXI4 主设备（**已实现**）
 - AXI4 读通道主设备（AR + R 通道），256-bit 总线宽度（HBM 伪通道带宽）
-- 请求 FIFO + 多事务流水（最多 4 个未完成读事务，单 ID 保序）
-- AXI4 写通道（AW + W + B），供数据集生成阶段写入 64 字节条目
-- 单元测试：`sim/tb_hbm_dataset_if.v`（含行为级 AXI 从设备模型）
+- 请求 FIFO + 多事务流水（最多 `RD_FIFO_DEPTH` 个未完成读事务，单 ID 保序）；
+  AR 发起前预留响应 FIFO 空间，故 `rready` 可常高且不会溢出
+- AXI4 写通道（AW + W + B）流水化：写请求 FIFO + AW/W/B 三通道解耦，
+  最多 `WR_FIFO_DEPTH` 笔未完成写事务，W 突发可背靠背发送（无气泡），
+  数据集生成不再被 B 响应往返阻塞
+- 参数化：`DATASET_BASE_ADDR`（数据集在 HBM 中的基址）、`RD/WR_FIFO_DEPTH`、
+  总线位宽（每条目拍数与 `arsize/arlen` 由参数自动推导）
+- 错误处理：`RRESP` 按突发聚合后随 `resp_err` 返回，`BRESP` 经 `wr_err`
+  （与 `wr_done` 同拍）上报，并汇总为粘滞位 `axi_err`（顶层状态寄存器 bit1）
+- R 拍重组以 `RLAST` 定界，从设备返回异常长度的突发也不会导致错位
+- 单元测试：`sim/tb_hbm_dataset_if.v`（行为级 AXI 从设备模型，含多事务流水、
+  背压、错误注入、AXI 属性与基址检查）
 - **TODO**：连接到 Vivado HBM IP；将写接口接到 superscalar_hash
 
 ### `alu_int.v` — 整数执行单元
@@ -164,15 +184,23 @@ randomx/
 - FADD/FSUB/FMUL：**TODO** — 需要 IEEE 754 加法器/乘法器
 - FDIV/FSQRT：**TODO** — 需要迭代除法/开方单元
 
-### `superscalar_hash.v` — SuperscalarHash 骨架
-- 程序缓冲区（4096 × 64-bit）
-- 简单顺序执行 FSM（取指→译码→执行→回写）
-- **TODO**：超标量调度（并行执行端口）
+### `superscalar_hash.v` — SuperscalarHash 执行单元（**已实现**）
+- 程序缓冲区（4096 × 64-bit），指令编码：
+  `[63:56]=opcode [55:53]=dst [52:50]=src [49:48]=mod_shift [31:0]=imm32`
+- 完整指令集（规范 §6.2）：ISUB_R、IXOR_R、IADD_RS、IMUL_R、IROR_C、
+  IADD_C7/C8/C9、IXOR_C7/C8/C9、IMULH_R、ISMULH_R、IMUL_RCP
+- 顺序执行 FSM（取指→译码→发射→回写），每条指令写回后再取下一条，
+  消除寄存器 RAW/WAW 冒险
+- IMUL_RCP 倒数单元：逐位恢复余数除法，计算 `floor(2^(63+bsr)/imm32)`
+  （与 `reciprocal.c` 位级一致），耗时 64+bsr(imm32) 周期
+- 单元测试：`sim/tb_superscalar_hash.v`（覆盖全部 14 种指令，比对软件模型结果）
+- **TODO**：超标量调度（并行执行端口，仅影响吞吐量，结果不变）
 
 ### `argon2_fill.v` — Argon2d Cache 填充骨架
 - 状态机：IDLE → H0 → INIT_BLK → FILL → COMPRESS → WRITE → DONE
-- 连接 Blake2b 核用于块压缩
-- **TODO**：完整 Argon2d G 函数、数据相关的参考块选择
+- 连接共享的 Blake2b 核用于块压缩：H0 计算使用 `b2b_init`（由核内部生成参数块 IV），
+  块压缩阶段改用 `b2b_h_in` 传入链值
+- **TODO**：完整 Argon2d G 函数、数据相关的参考块选择、变长哈希（H'）、多轮（t>1）
 
 ---
 
@@ -246,9 +274,19 @@ iverilog -g2001 -DSIMULATION \
 
 vvp sim/tb_randomx_top.vvp
 
-# Blake2b 核单元测试（RFC 7693 "abc" 测试向量）
+# Blake2b 核单元测试（RFC 7693 "abc"、空消息、多块、busy 握手）
 iverilog -g2001 -o sim/tb_blake2b.vvp rtl/blake2b_core.v sim/tb_blake2b.v
-vvp sim/tb_blake2b.vvp   # 输出 PASS
+vvp sim/tb_blake2b.vvp   # 输出 ALL TESTS PASSED
+
+# HBM 数据集接口单元测试（AXI4 从设备模型 + 错误注入）
+iverilog -g2001 -o sim/tb_hbm_dataset_if.vvp \
+    rtl/hbm_dataset_if.v sim/tb_hbm_dataset_if.v
+vvp sim/tb_hbm_dataset_if.vvp   # 输出 PASS
+
+# SuperscalarHash 单元测试（全指令集，比对软件模型）
+iverilog -g2001 -o sim/tb_superscalar_hash.vvp \
+    rtl/alu_int.v rtl/superscalar_hash.v sim/tb_superscalar_hash.v
+vvp sim/tb_superscalar_hash.vvp   # 输出 PASS
 
 # 查看波形（需安装 GTKWave）
 gtkwave tb_randomx_top.vcd
@@ -256,10 +294,11 @@ gtkwave tb_randomx_top.vcd
 
 ### 仅编译检查（无仿真）
 ```bash
-# 单独检查每个模块语法
+# 单独检查每个模块语法（-y rtl 让 iverilog 自动查找子模块，
+# 否则 randomx_top / randomx_vm / superscalar_hash / aes_* 会因缺少子模块而报错）
 for f in rtl/*.v; do
     echo "Checking $f..."
-    iverilog -g2001 -DSIMULATION -o /dev/null $f 2>&1 || echo "FAILED: $f"
+    iverilog -g2001 -DSIMULATION -y rtl -o /dev/null $f 2>&1 || echo "FAILED: $f"
 done
 ```
 
@@ -271,22 +310,35 @@ done
 
 ---
 
+## 单元测试状态
+
+以下 testbench 均可用 `iverilog -g2001` 编译运行（命令见[仿真说明](#仿真说明iverilog)）：
+
+| Testbench                  | 覆盖范围                                                | 结果 |
+|----------------------------|---------------------------------------------------------|------|
+| `sim/tb_blake2b.v`         | `"abc"`（外部 IV / `init` 两种）、空消息、200 字节两块链式哈希、`busy` 握手 | PASS（`ALL TESTS PASSED`）|
+| `sim/tb_hbm_dataset_if.v`  | 行为级 AXI4 从设备模型：多事务流水、背压、错误注入、AXI 属性与基址检查 | PASS |
+| `sim/tb_superscalar_hash.v`| 全部 14 种 SuperscalarHash 指令，与软件模型逐寄存器比对   | PASS（269 周期）|
+| `sim/tb_randomx_top.v`     | 顶层集成冒烟测试：寄存器写种子 → start → 轮询 done → 读回哈希；HBM 为 stub | 运行完成（非自校验）|
+
+---
+
 ## TODO / 实现状态
 
 | 模块              | 状态       | 主要 TODO                                  |
 |------------------|------------|-------------------------------------------|
 | randomx_top.v    | 骨架       | DS_GEN 阶段、完整 AXI-Lite 握手            |
-| blake2b_core.v   | 骨架       | sigma 表第2-11轮、完整 G 函数调度           |
+| blake2b_core.v   | **已实现** | 无（12 轮压缩、init/busy 接口，24 周期/块） |
 | aes_round.v      | **已实现** | 无（SubBytes/ShiftRows/MixColumns/ARK）    |
 | aes_gen1r/4r.v   | 骨架       | 从种子派生正确轮密钥                         |
 | aes_hash1r.v     | 骨架       | 从种子派生正确轮密钥                         |
 | scratchpad_mem.v | **已实现** | 无（URAM 推断、L1/L2/L3 掩码）             |
-| hbm_dataset_if.v | **已实现** | 连接 HBM IP、写接口接到 superscalar_hash    |
-| alu_int.v        | 骨架       | IMUL_RCP（倒数计算）、CBRANCH 条件掩码     |
+| hbm_dataset_if.v | **已实现** | 连接 Vivado HBM IP、写接口接到 superscalar_hash |
+| alu_int.v        | 基本实现   | IMUL_RCP（可复用 superscalar_hash 的倒数单元）|
 | fpu_double.v     | 骨架       | FADD/FSUB/FMUL（IEEE 754）、FDIV/FSQRT   |
-| superscalar_hash.v| 骨架      | 超标量调度、完整指令集编码                   |
+| superscalar_hash.v| **已实现** | 超标量调度（并行执行端口，性能优化）        |
 | randomx_vm.v     | 骨架       | 完整指令译码、内存地址计算、CFROUND         |
-| argon2_fill.v    | 骨架       | G 函数、数据相关参考块选择、多轮支持         |
+| argon2_fill.v    | 骨架       | G 函数、数据相关参考块选择、变长哈希、多轮支持 |
 
 ---
 
