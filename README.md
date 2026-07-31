@@ -13,7 +13,7 @@
 randomx/
 ├── rtl/                    # RTL 源码（纯 Verilog-2001）
 │   ├── randomx_top.v       # 顶层模块：时钟/复位、寄存器接口、主 FSM
-│   ├── blake2b_core.v      # Blake2b-512 哈希核（完整 12 轮压缩，已验证）
+│   ├── blake2b_core.v      # Blake2b-512 压缩核（12 轮，4 路并行 G，24 周期/块）
 │   ├── aes_round.v         # AES 单轮函数（SubBytes/ShiftRows/MixColumns/ARK）
 │   ├── aes_gen1r.v         # AesGenerator1R（1轮AES × 4 lane）
 │   ├── aes_gen4r.v         # AesGenerator4R（4轮AES × 4 lane）
@@ -27,7 +27,7 @@ randomx/
 │   └── argon2_fill.v       # Argon2d Cache 填充骨架（基于 Blake2b）
 ├── sim/
 │   ├── tb_randomx_top.v    # 基础功能仿真 testbench
-│   ├── tb_blake2b.v        # Blake2b-512 RFC 7693 测试向量 testbench
+│   ├── tb_blake2b.v        # Blake2b-512 参考测试向量 testbench（含多块/busy）
 │   ├── tb_hbm_dataset_if.v # HBM AXI4 接口 testbench（含 AXI 从设备模型）
 │   └── tb_superscalar_hash.v # SuperscalarHash 全指令集 testbench
 ├── vivado/
@@ -123,10 +123,15 @@ randomx/
 - **主 FSM**：IDLE → CACHE_INIT → VM_RUN → FINAL_HASH → DONE
 - **TODO**：DS_GEN 阶段、完整 AXI-Lite 握手
 
-### `blake2b_core.v` — Blake2b-512 哈希核（**已完成**）
-- G 函数数据通路（rotr32/rotr24/rotr16/rotr63）
-- 完整 sigma 置换表（12 轮）与 G 函数逐步调度（每周期 1 次 G 调用，约96周期/压缩）
-- 已通过 RFC 7693 测试向量验证（`sim/tb_blake2b.v`）
+### `blake2b_core.v` — Blake2b-512 压缩核（**已完成**）
+- `blake2b_g` 子模块：G 函数组合数据通路（rotr32/rotr24/rotr16/rotr63）
+- 完整 sigma 置换表（12 轮）；每周期并行执行 4 个 G 函数（1 个半轮），
+  共 **24 周期/压缩**（列半轮 + 对角半轮 × 12 轮）
+- `init` 输入：由核内部生成 Blake2b 参数块初始链值
+  （无密钥，摘要长度由参数 `DIGEST_BYTES` 指定，默认 64 字节），此时忽略 `h_in`
+- `busy` 输出：压缩进行中为高；`busy` 期间的 `start` 被忽略，防止状态被破坏
+- 已通过参考测试向量验证（`sim/tb_blake2b.v`）：
+  `"abc"`（外部 IV / `init` 两种方式）、空消息、200 字节两块链式哈希、`busy` 握手
 
 ### `aes_round.v` — AES 单轮函数
 - SubBytes：256 项 LUT S-box（纯组合逻辑）
@@ -264,9 +269,9 @@ iverilog -g2001 -DSIMULATION \
 
 vvp sim/tb_randomx_top.vvp
 
-# Blake2b 核单元测试（RFC 7693 "abc" 测试向量）
+# Blake2b 核单元测试（RFC 7693 "abc"、空消息、多块、busy 握手）
 iverilog -g2001 -o sim/tb_blake2b.vvp rtl/blake2b_core.v sim/tb_blake2b.v
-vvp sim/tb_blake2b.vvp   # 输出 PASS
+vvp sim/tb_blake2b.vvp   # 输出 ALL TESTS PASSED
 
 # HBM 数据集接口单元测试（AXI4 从设备模型 + 错误注入）
 iverilog -g2001 -o sim/tb_hbm_dataset_if.vvp \
@@ -304,7 +309,7 @@ done
 | 模块              | 状态       | 主要 TODO                                  |
 |------------------|------------|-------------------------------------------|
 | randomx_top.v    | 骨架       | DS_GEN 阶段、完整 AXI-Lite 握手            |
-| blake2b_core.v   | 骨架       | sigma 表第2-11轮、完整 G 函数调度           |
+| blake2b_core.v   | **已实现** | 无（12 轮压缩、init/busy 接口，24 周期/块） |
 | aes_round.v      | **已实现** | 无（SubBytes/ShiftRows/MixColumns/ARK）    |
 | aes_gen1r/4r.v   | 骨架       | 从种子派生正确轮密钥                         |
 | aes_hash1r.v     | 骨架       | 从种子派生正确轮密钥                         |
