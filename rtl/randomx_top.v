@@ -194,6 +194,8 @@ scratchpad_mem u_scratchpad (
 );
 
 // --- HBM AXI4 master interface ---
+wire hbm_axi_err;   // sticky AXI error status from the dataset interface
+
 hbm_dataset_if #(
     .AXI_ADDR_WIDTH (34),
     .AXI_DATA_WIDTH (256),
@@ -206,12 +208,15 @@ hbm_dataset_if #(
     .req_ready      (ds_req_ready),
     .resp_valid     (ds_resp_valid),
     .resp_data      (ds_resp_data),
+    .resp_err       (),                // dataset read error (see axi_err)
     .resp_ready     (ds_resp_ready),
     .wr_req_valid   (1'b0),            // TODO: drive from superscalar_hash
     .wr_req_item_idx(32'b0),
     .wr_req_data    (512'b0),
     .wr_req_ready   (),
     .wr_done        (),
+    .wr_err         (),
+    .axi_err        (hbm_axi_err),
     .m_axi_arid     (),                // ID not connected to top
     .m_axi_araddr   (m_axi_araddr),
     .m_axi_arlen    (m_axi_arlen),
@@ -329,7 +334,7 @@ always @(posedge clk or negedge rst_n) begin
     end else if (reg_rd_en) begin
         casez (reg_rd_addr)
             // Status: 0x44
-            8'h44: reg_rd_data <= {31'b0, ~busy};
+            8'h44: reg_rd_data <= {30'b0, hbm_axi_err, ~busy};
             // Hash output: 0x48..0x64 (8 × 32-bit)
             8'h48: reg_rd_data <= hash_out[ 31:  0];
             8'h4C: reg_rd_data <= hash_out[ 63: 32];

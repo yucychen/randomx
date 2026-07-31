@@ -9,29 +9,44 @@
 // This module is a full AXI4 master that:
 //   1. Accepts read requests from the VM (dataset item index), queued in a
 //      small request FIFO so the VM can post ahead of AR issue.
-//   2. Issues pipelined AXI4 AR bursts (2 beats × 256-bit per 64-byte item)
-//      with up to MAX_OUTSTANDING transactions in flight (single AXI ID, so
+//   2. Issues pipelined AXI4 AR bursts (ITEM_BYTES/beat-size beats per item)
+//      with up to RD_FIFO_DEPTH transactions in flight (single AXI ID, so
 //      responses are returned in order per the AXI4 spec).
 //   3. Reassembles R beats into 64-byte items in a response FIFO and returns
-//      them to the VM with valid/ready handshaking.
+//      them to the VM with valid/ready handshaking, together with the AXI
+//      response status of the burst (resp_err).
 //   4. Accepts write requests (dataset item index + 64-byte data) from the
-//      dataset generator (SuperscalarHash) and issues AXI4 AW/W bursts,
-//      waiting for the B response before accepting the next write.
+//      dataset generator (SuperscalarHash) into a write FIFO and issues
+//      pipelined AXI4 AW/W bursts with up to WR_FIFO_DEPTH outstanding write
+//      transactions, so the generator is not stalled by the B round trip.
 //
-// Flow control invariant: an AR is only issued when the response FIFO has
-// guaranteed space for the item (outstanding + queued responses < FIFO
-// depth), so m_axi_rready can be held high without risk of overflow.
+// Flow control invariants:
+//   - An AR is only issued when the response FIFO has guaranteed space for
+//     the item (outstanding + queued responses < depth), so m_axi_rready can
+//     be held high without risk of overflow.
+//   - A W burst is only started after the matching AW has been accepted, so
+//     address/data ordering is trivially correct; entries are released from
+//     the write FIFO when their last W beat is accepted.
+//   - Both paths use a single AXI ID, so AXI4 guarantees in-order responses.
 //
-// AXI4 signals follow AMBA AXI4 spec (no QoS/user extensions needed).
+// Addressing: byte address = DATASET_BASE_ADDR + item_idx × 64.
+//
+// AXI4 signals follow the AMBA AXI4 spec (no QoS/user extensions needed).
 // Verilog-2001 compliant.
 // =============================================================================
 
 `timescale 1ns/1ps
 
 module hbm_dataset_if #(
-    parameter AXI_ADDR_WIDTH = 34,  // 16 GB address space (XCVU33P HBM)
-    parameter AXI_DATA_WIDTH = 256, // HBM pseudo-channel bus width
-    parameter AXI_ID_WIDTH   = 6    // AXI ID width
+    parameter AXI_ADDR_WIDTH    = 34,  // 16 GB address space (XCVU33P HBM)
+    parameter AXI_DATA_WIDTH    = 256, // HBM pseudo-channel bus width
+    parameter AXI_ID_WIDTH      = 6,   // AXI ID width
+    // Byte offset of the dataset region inside HBM (must be 64-byte aligned)
+    parameter DATASET_BASE_ADDR = 0,
+    // Read request/response FIFO depth == max outstanding read bursts
+    parameter RD_FIFO_DEPTH     = 4,   // power of two, >= 2
+    // Write FIFO depth == max outstanding write bursts
+    parameter WR_FIFO_DEPTH     = 4    // power of two, >= 2
 ) (
     input  wire                       clk,
     input  wire                       rst_n,
@@ -45,6 +60,7 @@ module hbm_dataset_if #(
     // Response: 64-byte dataset item returned to VM
     output wire                       resp_valid,
     output wire [511:0]               resp_data,     // 64 bytes
+    output wire                       resp_err,      // AXI error for this item
     input  wire                       resp_ready,
 
     // ---- Dataset generator write request interface ----
@@ -52,8 +68,12 @@ module hbm_dataset_if #(
     input  wire                       wr_req_valid,
     input  wire [31:0]                wr_req_item_idx,
     input  wire [511:0]               wr_req_data,
-    output reg                        wr_req_ready,
+    output wire                       wr_req_ready,
     output reg                        wr_done,       // 1-cycle pulse on B resp
+    output reg                        wr_err,        // qualified by wr_done
+
+    // ---- Sticky AXI error status (cleared by reset only) ----
+    output reg                        axi_err,
 
     // ---- AXI4 Master — Read address channel ----
     output wire [AXI_ID_WIDTH-1:0]   m_axi_arid,
@@ -89,18 +109,32 @@ module hbm_dataset_if #(
     input  wire [AXI_ID_WIDTH-1:0]   m_axi_bid,
     input  wire [1:0]                 m_axi_bresp,
     input  wire                       m_axi_bvalid,
-    output reg                        m_axi_bready
+    output wire                       m_axi_bready
 );
 
 // ---------------------------------------------------------------------------
-// Constants
-// Dataset item size = 64 bytes → with 256-bit bus → 2 beats per item
+// Local helpers / constants
 // ---------------------------------------------------------------------------
-localparam BEATS_PER_ITEM  = 2;      // 64 bytes / 32 bytes per beat
-localparam [7:0] BURST_LEN = 8'd1;   // arlen/awlen = beats - 1
-localparam [2:0] BEAT_SIZE = 3'd5;   // 2^5 = 32 bytes per beat (256-bit)
-localparam FIFO_DEPTH      = 4;      // request / response FIFO depth
-localparam PTR_W           = 2;      // log2(FIFO_DEPTH)
+function integer clog2;
+    input integer value;
+    integer v;
+    begin
+        clog2 = 0;
+        for (v = value - 1; v > 0; v = v >> 1)
+            clog2 = clog2 + 1;
+    end
+endfunction
+
+localparam ITEM_BITS      = 512;                         // 64-byte item
+localparam BEATS_PER_ITEM = ITEM_BITS / AXI_DATA_WIDTH;  // 2 for 256-bit HBM
+localparam BEAT_CNT_W     = (BEATS_PER_ITEM > 1) ? clog2(BEATS_PER_ITEM) : 1;
+localparam [7:0] BURST_LEN = BEATS_PER_ITEM - 1;         // arlen/awlen
+localparam [2:0] BEAT_SIZE = clog2(AXI_DATA_WIDTH/8);    // 5 → 32 bytes
+
+localparam [AXI_ADDR_WIDTH-1:0] BASE_ADDR = DATASET_BASE_ADDR;
+
+localparam RD_PTR_W = clog2(RD_FIFO_DEPTH);
+localparam WR_PTR_W = clog2(WR_FIFO_DEPTH);
 
 // Static AXI attributes
 assign m_axi_arid    = {AXI_ID_WIDTH{1'b0}}; // single ID → in-order responses
@@ -114,11 +148,12 @@ assign m_axi_awburst = 2'b01;                // INCR
 assign m_axi_wstrb   = {(AXI_DATA_WIDTH/8){1'b1}}; // full-word writes
 
 // ---------------------------------------------------------------------------
-// Address calculation: item_idx × 64 bytes = item_idx << 6
+// Address calculation: DATASET_BASE_ADDR + item_idx × 64 bytes
 // ---------------------------------------------------------------------------
 function [AXI_ADDR_WIDTH-1:0] item_to_addr;
     input [31:0] item_idx;
-    item_to_addr = {{(AXI_ADDR_WIDTH-32){1'b0}}, item_idx} << 6;
+    item_to_addr = BASE_ADDR +
+                   ({{(AXI_ADDR_WIDTH-32){1'b0}}, item_idx} << 6);
 endfunction
 
 // ===========================================================================
@@ -126,71 +161,82 @@ endfunction
 // ===========================================================================
 
 // ---- Request FIFO (item indices posted by the VM) ----
-reg [31:0]      req_fifo [0:FIFO_DEPTH-1];
-reg [PTR_W-1:0] req_wp, req_rp;
-reg [PTR_W:0]   req_cnt;
+reg [31:0]         req_fifo [0:RD_FIFO_DEPTH-1];
+reg [RD_PTR_W-1:0] req_wp, req_rp;
+reg [RD_PTR_W:0]   req_cnt;
 
 wire req_push = req_valid && req_ready;
 
-assign req_ready = (req_cnt < FIFO_DEPTH);
+assign req_ready = (req_cnt < RD_FIFO_DEPTH);
 
 // ---- Response FIFO (assembled 64-byte items) ----
-reg [511:0]     resp_fifo [0:FIFO_DEPTH-1];
-reg [PTR_W-1:0] resp_wp, resp_rp;
-reg [PTR_W:0]   resp_cnt;
+reg [ITEM_BITS-1:0] resp_fifo [0:RD_FIFO_DEPTH-1];
+reg                 resp_err_fifo [0:RD_FIFO_DEPTH-1];
+reg [RD_PTR_W-1:0]  resp_wp, resp_rp;
+reg [RD_PTR_W:0]    resp_cnt;
 
 assign resp_valid = (resp_cnt != 0);
 assign resp_data  = resp_fifo[resp_rp];
+assign resp_err   = resp_err_fifo[resp_rp];
 
 wire resp_pop = resp_valid && resp_ready;
 
 // ---- Outstanding read transaction tracking ----
 // Only issue an AR when the response FIFO is guaranteed to have space for
 // every in-flight item: outstanding + resp_cnt + queued-resp-writes < DEPTH.
-reg [PTR_W:0] outstanding;
+reg [RD_PTR_W:0] outstanding;
 
 wire ar_fire   = m_axi_arvalid && m_axi_arready;
 // Reserve space for: retired items in resp FIFO + in-flight bursts + a
 // pending (not yet accepted) AR, so the resp FIFO can never overflow.
 wire can_issue = (req_cnt != 0) &&
                  ((outstanding + resp_cnt +
-                   {{PTR_W{1'b0}}, m_axi_arvalid}) < FIFO_DEPTH);
+                   {{RD_PTR_W{1'b0}}, m_axi_arvalid}) < RD_FIFO_DEPTH);
+wire ar_pop    = can_issue && (!m_axi_arvalid || m_axi_arready);
 
 // R data is always accepted — space is reserved at AR issue time.
 assign m_axi_rready = 1'b1;
 
-// ---- R beat reassembly (2 beats per item, in order) ----
-reg [255:0] rbeat_lo;   // first beat of the current item
-reg         rbeat_sel;  // 0 = expecting low beat, 1 = expecting high beat
+// ---- R beat reassembly ----
+// Beats arrive LSB-first; shift them in from the top so that beat 0 ends up
+// in resp_data[AXI_DATA_WIDTH-1:0]. RLAST (not a local counter) delimits the
+// item, so a slave returning a different burst length cannot desynchronise
+// the assembler.
+reg [ITEM_BITS-1:0]  rd_shift;
+reg                  rd_err_acc;
 
-wire r_fire      = m_axi_rvalid && m_axi_rready;
-wire resp_push   = r_fire && rbeat_sel; // second (last) beat completes an item
-wire item_retire = r_fire && m_axi_rlast;
+wire                 r_fire      = m_axi_rvalid && m_axi_rready;
+wire                 r_beat_err  = (m_axi_rresp != 2'b00);
+wire                 item_retire = r_fire && m_axi_rlast;
+wire                 resp_push   = item_retire;
+wire [ITEM_BITS-1:0] rd_shift_nxt = {m_axi_rdata,
+                                     rd_shift[ITEM_BITS-1:AXI_DATA_WIDTH]};
 
 integer i;
 
 always @(posedge clk or negedge rst_n) begin
     if (!rst_n) begin
-        req_wp        <= {PTR_W{1'b0}};
-        req_rp        <= {PTR_W{1'b0}};
-        req_cnt       <= {(PTR_W+1){1'b0}};
-        resp_wp       <= {PTR_W{1'b0}};
-        resp_rp       <= {PTR_W{1'b0}};
-        resp_cnt      <= {(PTR_W+1){1'b0}};
-        outstanding   <= {(PTR_W+1){1'b0}};
+        req_wp        <= {RD_PTR_W{1'b0}};
+        req_rp        <= {RD_PTR_W{1'b0}};
+        req_cnt       <= {(RD_PTR_W+1){1'b0}};
+        resp_wp       <= {RD_PTR_W{1'b0}};
+        resp_rp       <= {RD_PTR_W{1'b0}};
+        resp_cnt      <= {(RD_PTR_W+1){1'b0}};
+        outstanding   <= {(RD_PTR_W+1){1'b0}};
         m_axi_araddr  <= {AXI_ADDR_WIDTH{1'b0}};
         m_axi_arvalid <= 1'b0;
-        rbeat_lo      <= 256'b0;
-        rbeat_sel     <= 1'b0;
-        for (i = 0; i < FIFO_DEPTH; i = i + 1) begin
-            req_fifo[i]  <= 32'b0;
-            resp_fifo[i] <= 512'b0;
+        rd_shift      <= {ITEM_BITS{1'b0}};
+        rd_err_acc    <= 1'b0;
+        for (i = 0; i < RD_FIFO_DEPTH; i = i + 1) begin
+            req_fifo[i]      <= 32'b0;
+            resp_fifo[i]     <= {ITEM_BITS{1'b0}};
+            resp_err_fifo[i] <= 1'b0;
         end
     end else begin
         // --- Request FIFO push ---
         if (req_push) begin
             req_fifo[req_wp] <= req_item_idx;
-            req_wp           <= req_wp + {{(PTR_W-1){1'b0}}, 1'b1};
+            req_wp           <= req_wp + {{(RD_PTR_W-1){1'b0}}, 1'b1};
         end
 
         // --- AR issue: pop request FIFO into AR channel ---
@@ -198,7 +244,7 @@ always @(posedge clk or negedge rst_n) begin
             if (can_issue) begin
                 m_axi_araddr  <= item_to_addr(req_fifo[req_rp]);
                 m_axi_arvalid <= 1'b1;
-                req_rp        <= req_rp + {{(PTR_W-1){1'b0}}, 1'b1};
+                req_rp        <= req_rp + {{(RD_PTR_W-1){1'b0}}, 1'b1};
             end else begin
                 m_axi_arvalid <= 1'b0;
             end
@@ -206,22 +252,24 @@ always @(posedge clk or negedge rst_n) begin
 
         // --- R beat capture / item reassembly ---
         if (r_fire) begin
-            if (!rbeat_sel) begin
-                rbeat_lo  <= m_axi_rdata;
-                rbeat_sel <= 1'b1;
+            rd_shift <= rd_shift_nxt;
+            if (m_axi_rlast) begin
+                resp_fifo[resp_wp]     <= rd_shift_nxt;
+                resp_err_fifo[resp_wp] <= rd_err_acc | r_beat_err;
+                resp_wp                <= resp_wp +
+                                          {{(RD_PTR_W-1){1'b0}}, 1'b1};
+                rd_err_acc             <= 1'b0;
             end else begin
-                resp_fifo[resp_wp] <= {m_axi_rdata, rbeat_lo};
-                resp_wp            <= resp_wp + {{(PTR_W-1){1'b0}}, 1'b1};
-                rbeat_sel          <= 1'b0;
+                rd_err_acc <= rd_err_acc | r_beat_err;
             end
         end
 
         // --- Response FIFO pop ---
         if (resp_pop)
-            resp_rp <= resp_rp + {{(PTR_W-1){1'b0}}, 1'b1};
+            resp_rp <= resp_rp + {{(RD_PTR_W-1){1'b0}}, 1'b1};
 
         // --- Counters (push/pop may happen in the same cycle) ---
-        case ({req_push, can_issue && (!m_axi_arvalid || m_axi_arready)})
+        case ({req_push, ar_pop})
             2'b10:   req_cnt <= req_cnt + 1'b1;
             2'b01:   req_cnt <= req_cnt - 1'b1;
             default: ; // 00 or 11: no net change
@@ -242,82 +290,151 @@ always @(posedge clk or negedge rst_n) begin
 end
 
 // ===========================================================================
-// WRITE PATH — one item at a time: AW → W (2 beats) → B
+// WRITE PATH — write FIFO → pipelined AW issue → W bursts → B retirement
+//
+// Three loosely coupled engines share one FIFO:
+//   aw_rp : entries whose address has not been pushed onto the AW channel
+//   w_rp  : entries whose AW has fired and whose data still has to be sent
+//   b     : bursts whose data was sent and whose B response is outstanding
 // ===========================================================================
-localparam WST_IDLE = 2'd0;
-localparam WST_AW   = 2'd1;  // waiting for AW handshake
-localparam WST_DATA = 2'd2;  // sending W beats
-localparam WST_B    = 2'd3;  // waiting for B response
+reg [AXI_ADDR_WIDTH-1:0] wr_addr_fifo [0:WR_FIFO_DEPTH-1];
+reg [ITEM_BITS-1:0]      wr_data_fifo [0:WR_FIFO_DEPTH-1];
 
-reg [1:0]   wstate;
-reg [511:0] wdata_buf;
-reg         wbeat_sel;  // 0 = low beat, 1 = high (last) beat
+reg [WR_PTR_W-1:0] wr_wp, aw_rp, w_rp;
+reg [WR_PTR_W:0]   wr_cnt;    // entries pushed, data not yet fully sent
+reg [WR_PTR_W:0]   aw_pend;   // entries whose address is not yet on AW
+reg [WR_PTR_W:0]   w_pend;    // entries whose AW fired, data not yet started
+reg [WR_PTR_W:0]   b_out;     // AW accepted, B not yet received
+
+wire wr_push = wr_req_valid && wr_req_ready;
+
+assign wr_req_ready = (wr_cnt < WR_FIFO_DEPTH) && (b_out < WR_FIFO_DEPTH);
+
+// B responses are always accepted (b_out is bounded by WR_FIFO_DEPTH).
+assign m_axi_bready = 1'b1;
+
+wire aw_fire = m_axi_awvalid && m_axi_awready;
+wire b_fire  = m_axi_bvalid  && m_axi_bready;
+// Reserve one B slot for a pending (not yet accepted) AW.
+wire aw_can  = (aw_pend != 0) &&
+               ((b_out + {{WR_PTR_W{1'b0}}, m_axi_awvalid}) < WR_FIFO_DEPTH);
+wire aw_pop  = aw_can && (!m_axi_awvalid || m_axi_awready);
+
+// ---- W data engine ----
+reg [ITEM_BITS-1:0]  w_shift;
+reg [BEAT_CNT_W:0]   wbeat;     // number of beats already presented
+
+wire w_fire       = m_axi_wvalid && m_axi_wready;
+wire w_burst_last = w_fire && m_axi_wlast;
+// A new burst may start when the engine is idle or is retiring its last beat
+wire w_slot_free  = (!m_axi_wvalid) || w_burst_last;
+wire w_start      = w_slot_free && (w_pend != 0);
+
+wire [ITEM_BITS-1:0] w_entry     = wr_data_fifo[w_rp];
+wire [ITEM_BITS-1:0] w_shift_nxt = w_shift >> AXI_DATA_WIDTH;
+
+integer j;
 
 always @(posedge clk or negedge rst_n) begin
     if (!rst_n) begin
-        wstate        <= WST_IDLE;
-        wr_req_ready  <= 1'b1;
+        wr_wp         <= {WR_PTR_W{1'b0}};
+        aw_rp         <= {WR_PTR_W{1'b0}};
+        w_rp          <= {WR_PTR_W{1'b0}};
+        wr_cnt        <= {(WR_PTR_W+1){1'b0}};
+        aw_pend       <= {(WR_PTR_W+1){1'b0}};
+        w_pend        <= {(WR_PTR_W+1){1'b0}};
+        b_out         <= {(WR_PTR_W+1){1'b0}};
         wr_done       <= 1'b0;
-        wdata_buf     <= 512'b0;
-        wbeat_sel     <= 1'b0;
+        wr_err        <= 1'b0;
+        axi_err       <= 1'b0;
+        w_shift       <= {ITEM_BITS{1'b0}};
+        wbeat         <= {(BEAT_CNT_W+1){1'b0}};
         m_axi_awaddr  <= {AXI_ADDR_WIDTH{1'b0}};
         m_axi_awvalid <= 1'b0;
         m_axi_wdata   <= {AXI_DATA_WIDTH{1'b0}};
         m_axi_wlast   <= 1'b0;
         m_axi_wvalid  <= 1'b0;
-        m_axi_bready  <= 1'b0;
+        for (j = 0; j < WR_FIFO_DEPTH; j = j + 1) begin
+            wr_addr_fifo[j] <= {AXI_ADDR_WIDTH{1'b0}};
+            wr_data_fifo[j] <= {ITEM_BITS{1'b0}};
+        end
     end else begin
         wr_done <= 1'b0;
+        wr_err  <= 1'b0;
 
-        case (wstate)
-            WST_IDLE: begin
-                if (wr_req_valid && wr_req_ready) begin
-                    wr_req_ready  <= 1'b0;
-                    wdata_buf     <= wr_req_data;
-                    m_axi_awaddr  <= item_to_addr(wr_req_item_idx);
-                    m_axi_awvalid <= 1'b1;
-                    wbeat_sel     <= 1'b0;
-                    wstate        <= WST_AW;
-                end
+        // --- Write FIFO push ---
+        if (wr_push) begin
+            wr_addr_fifo[wr_wp] <= item_to_addr(wr_req_item_idx);
+            wr_data_fifo[wr_wp] <= wr_req_data;
+            wr_wp               <= wr_wp + {{(WR_PTR_W-1){1'b0}}, 1'b1};
+        end
+
+        // --- AW issue ---
+        if (!m_axi_awvalid || m_axi_awready) begin
+            if (aw_can) begin
+                m_axi_awaddr  <= wr_addr_fifo[aw_rp];
+                m_axi_awvalid <= 1'b1;
+                aw_rp         <= aw_rp + {{(WR_PTR_W-1){1'b0}}, 1'b1};
+            end else begin
+                m_axi_awvalid <= 1'b0;
             end
+        end
 
-            WST_AW: begin
-                if (m_axi_awready && m_axi_awvalid) begin
-                    m_axi_awvalid <= 1'b0;
-                    m_axi_wdata   <= wdata_buf[255:0];
-                    m_axi_wlast   <= 1'b0;
-                    m_axi_wvalid  <= 1'b1;
-                    wstate        <= WST_DATA;
-                end
-            end
+        // --- W data burst ---
+        if (w_start) begin
+            // Load the first beat of the next entry (back-to-back capable)
+            m_axi_wdata  <= w_entry[AXI_DATA_WIDTH-1:0];
+            m_axi_wvalid <= 1'b1;
+            m_axi_wlast  <= (BEATS_PER_ITEM == 1);
+            w_shift      <= w_entry >> AXI_DATA_WIDTH;
+            wbeat        <= {{BEAT_CNT_W{1'b0}}, 1'b1};
+        end else if (w_burst_last) begin
+            m_axi_wvalid <= 1'b0;
+            m_axi_wlast  <= 1'b0;
+            wbeat        <= {(BEAT_CNT_W+1){1'b0}};
+        end else if (w_fire) begin
+            m_axi_wdata  <= w_shift[AXI_DATA_WIDTH-1:0];
+            m_axi_wlast  <= ((wbeat + 1'b1) == BEATS_PER_ITEM);
+            w_shift      <= w_shift_nxt;
+            wbeat        <= wbeat + 1'b1;
+        end
 
-            WST_DATA: begin
-                if (m_axi_wready && m_axi_wvalid) begin
-                    if (!wbeat_sel) begin
-                        // Low beat accepted — send high (last) beat
-                        m_axi_wdata  <= wdata_buf[511:256];
-                        m_axi_wlast  <= 1'b1;
-                        wbeat_sel    <= 1'b1;
-                    end else begin
-                        // Last beat accepted — wait for write response
-                        m_axi_wvalid <= 1'b0;
-                        m_axi_wlast  <= 1'b0;
-                        m_axi_bready <= 1'b1;
-                        wstate       <= WST_B;
-                    end
-                end
-            end
+        if (w_start)
+            w_rp <= w_rp + {{(WR_PTR_W-1){1'b0}}, 1'b1};
 
-            WST_B: begin
-                if (m_axi_bvalid) begin
-                    m_axi_bready <= 1'b0;
-                    wr_done      <= 1'b1;
-                    wr_req_ready <= 1'b1;
-                    wstate       <= WST_IDLE;
-                end
-            end
+        // --- B response retirement ---
+        if (b_fire) begin
+            wr_done <= 1'b1;
+            wr_err  <= (m_axi_bresp != 2'b00);
+        end
 
-            default: wstate <= WST_IDLE;
+        // --- Sticky AXI error status ---
+        if ((b_fire && (m_axi_bresp != 2'b00)) || (r_fire && r_beat_err))
+            axi_err <= 1'b1;
+
+        // --- Counters ---
+        case ({wr_push, w_burst_last})
+            2'b10:   wr_cnt <= wr_cnt + 1'b1;
+            2'b01:   wr_cnt <= wr_cnt - 1'b1;
+            default: ;
+        endcase
+
+        case ({wr_push, aw_pop})
+            2'b10:   aw_pend <= aw_pend + 1'b1;
+            2'b01:   aw_pend <= aw_pend - 1'b1;
+            default: ;
+        endcase
+
+        case ({aw_fire, w_start})
+            2'b10:   w_pend <= w_pend + 1'b1;
+            2'b01:   w_pend <= w_pend - 1'b1;
+            default: ;
+        endcase
+
+        case ({aw_fire, b_fire})
+            2'b10:   b_out <= b_out + 1'b1;
+            2'b01:   b_out <= b_out - 1'b1;
+            default: ;
         endcase
     end
 end

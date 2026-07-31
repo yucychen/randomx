@@ -23,11 +23,12 @@ randomx/
 │   ├── alu_int.v           # 整数执行单元（19条整数指令）
 │   ├── fpu_double.v        # 双精度浮点单元骨架（FSCAL/FSWAP 已实现）
 │   ├── scratchpad_mem.v    # 2 MiB Scratchpad（URAM 推断，L1/L2/L3 掩码）
-│   ├── hbm_dataset_if.v    # HBM2 AXI4 主设备接口骨架（数据集访问）
+│   ├── hbm_dataset_if.v    # HBM2 AXI4 主设备接口（数据集读写，流水化）
 │   └── argon2_fill.v       # Argon2d Cache 填充骨架（基于 Blake2b）
 ├── sim/
 │   ├── tb_randomx_top.v    # 基础功能仿真 testbench
 │   ├── tb_blake2b.v        # Blake2b-512 RFC 7693 测试向量 testbench
+│   ├── tb_hbm_dataset_if.v # HBM AXI4 接口 testbench（含 AXI 从设备模型）
 │   └── tb_superscalar_hash.v # SuperscalarHash 全指令集 testbench
 ├── vivado/
 │   ├── build.tcl           # Vivado TCL 构建脚本（非项目模式）
@@ -117,7 +118,7 @@ randomx/
   |---------|------|-----------------------------|
   | 0x00~0x3C | 写  | 种子输入（512位，16×32位）   |
   | 0x40    | 写   | 控制寄存器（bit0=start）      |
-  | 0x44    | 读   | 状态寄存器（bit0=done/~busy） |
+  | 0x44    | 读   | 状态寄存器（bit0=done/~busy，bit1=HBM AXI 错误粘滞位） |
   | 0x48~0x84 | 读 | 哈希输出（512位，16×32位）   |
 - **主 FSM**：IDLE → CACHE_INIT → VM_RUN → FINAL_HASH → DONE
 - **TODO**：DS_GEN 阶段、完整 AXI-Lite 握手
@@ -147,9 +148,18 @@ randomx/
 
 ### `hbm_dataset_if.v` — HBM2 数据集 AXI4 主设备（**已实现**）
 - AXI4 读通道主设备（AR + R 通道），256-bit 总线宽度（HBM 伪通道带宽）
-- 请求 FIFO + 多事务流水（最多 4 个未完成读事务，单 ID 保序）
-- AXI4 写通道（AW + W + B），供数据集生成阶段写入 64 字节条目
-- 单元测试：`sim/tb_hbm_dataset_if.v`（含行为级 AXI 从设备模型）
+- 请求 FIFO + 多事务流水（最多 `RD_FIFO_DEPTH` 个未完成读事务，单 ID 保序）；
+  AR 发起前预留响应 FIFO 空间，故 `rready` 可常高且不会溢出
+- AXI4 写通道（AW + W + B）流水化：写请求 FIFO + AW/W/B 三通道解耦，
+  最多 `WR_FIFO_DEPTH` 笔未完成写事务，W 突发可背靠背发送（无气泡），
+  数据集生成不再被 B 响应往返阻塞
+- 参数化：`DATASET_BASE_ADDR`（数据集在 HBM 中的基址）、`RD/WR_FIFO_DEPTH`、
+  总线位宽（每条目拍数与 `arsize/arlen` 由参数自动推导）
+- 错误处理：`RRESP` 按突发聚合后随 `resp_err` 返回，`BRESP` 经 `wr_err`
+  （与 `wr_done` 同拍）上报，并汇总为粘滞位 `axi_err`（顶层状态寄存器 bit1）
+- R 拍重组以 `RLAST` 定界，从设备返回异常长度的突发也不会导致错位
+- 单元测试：`sim/tb_hbm_dataset_if.v`（行为级 AXI 从设备模型，含多事务流水、
+  背压、错误注入、AXI 属性与基址检查）
 - **TODO**：连接到 Vivado HBM IP；将写接口接到 superscalar_hash
 
 ### `alu_int.v` — 整数执行单元
@@ -258,6 +268,11 @@ vvp sim/tb_randomx_top.vvp
 iverilog -g2001 -o sim/tb_blake2b.vvp rtl/blake2b_core.v sim/tb_blake2b.v
 vvp sim/tb_blake2b.vvp   # 输出 PASS
 
+# HBM 数据集接口单元测试（AXI4 从设备模型 + 错误注入）
+iverilog -g2001 -o sim/tb_hbm_dataset_if.vvp \
+    rtl/hbm_dataset_if.v sim/tb_hbm_dataset_if.v
+vvp sim/tb_hbm_dataset_if.vvp   # 输出 PASS
+
 # SuperscalarHash 单元测试（全指令集，比对软件模型）
 iverilog -g2001 -o sim/tb_superscalar_hash.vvp \
     rtl/alu_int.v rtl/superscalar_hash.v sim/tb_superscalar_hash.v
@@ -294,7 +309,7 @@ done
 | aes_gen1r/4r.v   | 骨架       | 从种子派生正确轮密钥                         |
 | aes_hash1r.v     | 骨架       | 从种子派生正确轮密钥                         |
 | scratchpad_mem.v | **已实现** | 无（URAM 推断、L1/L2/L3 掩码）             |
-| hbm_dataset_if.v | **已实现** | 连接 HBM IP、写接口接到 superscalar_hash    |
+| hbm_dataset_if.v | **已实现** | 连接 Vivado HBM IP、写接口接到 superscalar_hash |
 | alu_int.v        | 骨架       | IMUL_RCP（倒数计算）、CBRANCH 条件掩码     |
 | fpu_double.v     | 骨架       | FADD/FSUB/FMUL（IEEE 754）、FDIV/FSQRT   |
 | superscalar_hash.v| **已实现** | 超标量调度（并行执行端口，性能优化）        |
