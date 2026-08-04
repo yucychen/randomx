@@ -162,6 +162,7 @@ reg  [63:0] fpu_a, fpu_b;
 reg         fpu_en;
 wire [63:0] fpu_result;
 wire        fpu_valid;
+wire        fpu_busy;
 
 fpu_double u_fpu (
     .clk          (clk),
@@ -172,7 +173,8 @@ fpu_double u_fpu (
     .src_b        (fpu_b),
     .round_mode   (fprc),
     .result       (fpu_result),
-    .result_valid (fpu_valid)
+    .result_valid (fpu_valid),
+    .busy         (fpu_busy)
 );
 
 // ---------------------------------------------------------------------------
@@ -194,6 +196,7 @@ localparam ST_FINAL     = 4'd7;  // final hash
 localparam ST_DONE      = 4'd8;
 localparam ST_COMPILE   = 4'd9;  // pre-pass: compute CBRANCH targets
 localparam ST_BR_WAIT   = 4'd10; // wait for CBRANCH ALU result
+localparam ST_FP_WAIT   = 4'd11; // wait for multi-cycle FDIV/FSQRT result
 
 reg [3:0] state;
 reg [3:0] wb_dst;
@@ -434,7 +437,9 @@ always @(posedge clk or negedge rst_n) begin
                     end
 
                     OPC_FSWAP_R: begin
-                        // Swap low/high halves of f or e register
+                        // Swap low/high halves of the f register pair: the lo
+                        // half receives the hi half (the hi half is updated by
+                        // the companion FSWAP writeback in ST_FP_WAIT).
                         // TODO: Properly determine whether to swap f or e
                         fpu_op   <= 5'd8;
                         fpu_a    <= f_lo[dst_idx[1:0]];
@@ -444,6 +449,29 @@ always @(posedge clk or negedge rst_n) begin
                         wb_fp_en <= 1'b1;
                         fp_hi_sel<= 1'b0;
                         state    <= ST_WB;
+                    end
+
+                    // Multi-cycle FP instructions (FDIV / FSQRT)
+                    OPC_FDIV_M: begin
+                        fpu_op   <= 5'd5;
+                        fpu_a    <= e_lo[dst_idx[1:0]];
+                        fpu_b    <= a_lo[src_idx[1:0]];
+                        fpu_en   <= 1'b1;
+                        wb_dst   <= dst_idx;
+                        wb_fp_en <= 1'b1;
+                        fp_hi_sel<= 1'b0;
+                        state    <= ST_FP_WAIT;
+                    end
+
+                    OPC_FSQRT_R: begin
+                        fpu_op   <= 5'd6;
+                        fpu_a    <= e_lo[dst_idx[1:0]];
+                        fpu_b    <= 64'b0;
+                        fpu_en   <= 1'b1;
+                        wb_dst   <= dst_idx;
+                        wb_fp_en <= 1'b1;
+                        fp_hi_sel<= 1'b0;
+                        state    <= ST_FP_WAIT;
                     end
 
                     OPC_CFROUND: begin
@@ -498,6 +526,13 @@ always @(posedge clk or negedge rst_n) begin
                     ic    <= ic + 8'd1;
                     state <= ST_FETCH;
                 end
+            end
+
+            ST_FP_WAIT: begin
+                // Multi-cycle FPU op in flight; writeback happens in the
+                // global (fpu_valid && wb_fp_en) block above
+                if (fpu_valid)
+                    state <= ST_WB;
             end
 
             ST_BR_WAIT: begin

@@ -4,7 +4,7 @@
 
 > **状态：部分实现**  
 > 所有模块均可使用 `iverilog -g2001` 编译并通过仿真。
-> `blake2b_core` / `aes_round` / `scratchpad_mem` / `hbm_dataset_if` / `superscalar_hash`
+> `blake2b_core` / `aes_round` / `scratchpad_mem` / `hbm_dataset_if` / `superscalar_hash` / `fpu_double`
 > 已完整实现并有单元测试覆盖（见 [单元测试状态](#单元测试状态)）；
 > 其余模块为骨架，功能逻辑以 `TODO` 注释标注，待完整实现。
 
@@ -25,7 +25,7 @@ randomx/
 │   ├── superscalar_hash.v  # SuperscalarHash（数据集生成程序执行单元）
 │   ├── randomx_vm.v        # RandomX 虚拟机（取指/译码/执行/回写）
 │   ├── alu_int.v           # 整数执行单元（19条整数指令）
-│   ├── fpu_double.v        # 双精度浮点单元骨架（FSCAL/FSWAP 已实现）
+│   ├── fpu_double.v        # 双精度浮点单元（IEEE 754 加/减/乘/除/开方 + FSCAL/FSWAP）
 │   ├── scratchpad_mem.v    # 2 MiB Scratchpad（URAM 推断，L1/L2/L3 掩码）
 │   ├── hbm_dataset_if.v    # HBM2 AXI4 主设备接口（数据集读写，流水化）
 │   └── argon2_fill.v       # Argon2d Cache 填充骨架（基于 Blake2b）
@@ -180,11 +180,19 @@ randomx/
 - VM 侧：ST_COMPILE 预编译遍历按寄存器使用情况计算分支目标，跳转回 target+1
 - **TODO**：IMUL_RCP（模乘倒数）
 
-### `fpu_double.v` — 双精度浮点单元
-- FSCAL_R：符号位异或 + 指数异或（**已实现**）
-- FSWAP_R：寄存器高/低半部交换（**已实现**）
-- FADD/FSUB/FMUL：**TODO** — 需要 IEEE 754 加法器/乘法器
-- FDIV/FSQRT：**TODO** — 需要迭代除法/开方单元
+### `fpu_double.v` — 双精度浮点单元（**已实现**）
+- FADD_R/M、FSUB_R/M：IEEE 754 加减法（对阶 → 加减 → 规格化 → 舍入），单周期
+- FMUL_E：IEEE 754 乘法（53×53 → 106 位乘积，规格化 + 舍入），单周期，可推断 DSP48
+- FDIV_M：恢复余数迭代除法，56 周期 + 握手周期
+- FSQRT_R：恢复余数迭代开方，56 周期 + 握手周期
+- FSCAL_R：`dst.u ^= 0x80F0000000000000`（符号位 + 指数低 4 位异或）
+- FSWAP_R：128 位寄存器对高/低半部交换
+- 四种舍入模式（FPRC）：就近偶数 / 向 -inf / 向 +inf / 向零，
+  对上溢时按舍入模式产生 Inf 或最大规格数
+- 完整特殊值处理：NaN（安静 NaN `0x7FF8000000000000`）、±Inf、±0、
+  非规格化输入与渐进下溢（非规格化输出）
+- 握手：`en` 拉高一周期发起运算，`result_valid` 单周期脉冲输出结果；
+  多周期运算期间 `busy` 为高，此时不得再次拉高 `en`
 
 ### `superscalar_hash.v` — SuperscalarHash 执行单元（**已实现**）
 - 程序缓冲区（4096 × 64-bit），指令编码：
@@ -347,6 +355,7 @@ done
 | `sim/tb_blake2b.v`         | `"abc"`（外部 IV / `init` 两种）、空消息、200 字节两块链式哈希、`busy` 握手 | PASS（`ALL TESTS PASSED`）|
 | `sim/tb_hbm_dataset_if.v`  | 行为级 AXI4 从设备模型：多事务流水、背压、错误注入、AXI 属性与基址检查 | PASS |
 | `sim/tb_superscalar_hash.v`| 全部 14 种 SuperscalarHash 指令，与软件模型逐寄存器比对   | PASS（269 周期）|
+| `sim/tb_fpu_double.v`      | FADD/FSUB/FMUL/FDIV/FSQRT/FSCAL/FSWAP，含 4 种舍入模式、NaN/Inf/±0、非规格化、上溢/下溢与 `busy` 握手 | PASS（47 项检查）|
 | `sim/tb_randomx_top.v`     | 顶层集成冒烟测试：寄存器写种子 → start → 轮询 done → 读回哈希；HBM 为 stub | 运行完成（非自校验）|
 
 > `make test` 会逐个运行上述 testbench，并在输出中出现 `FAIL` / `ERROR` 时返回非 0 退出码。
@@ -354,7 +363,7 @@ done
 ### 验证方面的已知缺口
 - `tb_randomx_top.v` 尚非自校验：缺少与参考实现的期望哈希比对。
 - 尚无 testbench 覆盖：`aes_round` / `aes_gen1r` / `aes_gen4r` / `aes_hash1r`、
-  `alu_int`、`fpu_double`、`scratchpad_mem`、`argon2_fill`、`randomx_vm`。
+  `alu_int`、`scratchpad_mem`、`argon2_fill`、`randomx_vm`。
 - 缺少与官方 [tevador/RandomX](https://github.com/tevador/RandomX) 参考实现的
   端到端测试向量对拍（黄金模型对比）。
 
@@ -372,7 +381,7 @@ done
 | scratchpad_mem.v | **已实现** | 无（URAM 推断、L1/L2/L3 掩码）             |
 | hbm_dataset_if.v | **已实现** | 连接 Vivado HBM IP、写接口接到 superscalar_hash |
 | alu_int.v        | 基本实现   | IMUL_RCP（可复用 superscalar_hash 的倒数单元）|
-| fpu_double.v     | 骨架       | FADD/FSUB/FMUL（IEEE 754）、FDIV/FSQRT   |
+| fpu_double.v     | **已实现** | 流水化以提升 Fmax（当前加/乘为单周期组合路径）|
 | superscalar_hash.v| **已实现** | 超标量调度（并行执行端口，性能优化）        |
 | randomx_vm.v     | 骨架       | 完整指令译码、内存地址计算、CFROUND         |
 | argon2_fill.v    | 骨架       | G 函数、数据相关参考块选择、变长哈希、多轮支持 |
@@ -381,20 +390,17 @@ done
 
 ## 完善路线图（优先级从高到低）
 
-1. **`fpu_double.v`** — 实现 IEEE 754 双精度 FADD/FSUB/FMUL（DSP48），
-   以及迭代式 FDIV/FSQRT，并支持 4 种舍入模式。当前实现返回占位值，
-   哈希结果必然不正确。
-2. **`argon2_fill.v`** — Argon2d G 压缩函数、数据相关参考块选择、
+1. **`argon2_fill.v`** — Argon2d G 压缩函数、数据相关参考块选择、
    多 pass 支持、Blake2b 变长输出（H'），并接到真实 cache 存储。
-3. **`randomx_vm.v`** — 29 条 ISA 完整译码、CFROUND、L1/L2/L3 地址掩码、
+2. **`randomx_vm.v`** — 29 条 ISA 完整译码、CFROUND、L1/L2/L3 地址掩码、
    浮点寄存器前递、Dataset 取数与 MX/MA 更新、程序结束的 Scratchpad XOR + AesHash1R。
-4. **`randomx_top.v`** — 打通 DS_GEN（SuperscalarHash 8 pass）与 FINAL_HASH，
+3. **`randomx_top.v`** — 打通 DS_GEN（SuperscalarHash 8 pass）与 FINAL_HASH，
    驱动 HBM 写通道，修正 `key_len` 编码（6 bit 无法表示 64 字节）。
-5. **AES 轮密钥** — `aes_gen1r` / `aes_gen4r` / `aes_hash1r` 中的常量目前为占位值，
+4. **AES 轮密钥** — `aes_gen1r` / `aes_gen4r` / `aes_hash1r` 中的常量目前为占位值，
    需按 spec 3.3/3.4 从种子派生。
-6. **`alu_int.v` IMUL_RCP** — 2^128 / b 倒数计算。
-7. **验证** — 补齐单元 testbench，并与参考实现做端到端向量对拍。
-8. **后端** — `constraints.xdc` 中的 `PIN_NAME` 占位符、HBM 参考时钟约束、
+5. **`alu_int.v` IMUL_RCP** — 2^128 / b 倒数计算。
+6. **验证** — 补齐单元 testbench，并与参考实现做端到端向量对拍。
+7. **后端** — `constraints.xdc` 中的 `PIN_NAME` 占位符、HBM 参考时钟约束、
    跨时钟域约束；`build.tcl` 中实例化 Vivado HBM IP；验证 300 MHz 时序收敛与资源占用。
 
 ---

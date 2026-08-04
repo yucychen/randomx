@@ -37,9 +37,10 @@ RTL_SRCS := \
 SRCS_tb_blake2b         := $(RTL_DIR)/blake2b_core.v
 SRCS_tb_hbm_dataset_if  := $(RTL_DIR)/hbm_dataset_if.v
 SRCS_tb_superscalar_hash:= $(RTL_DIR)/alu_int.v $(RTL_DIR)/superscalar_hash.v
+SRCS_tb_fpu_double      := $(RTL_DIR)/fpu_double.v
 SRCS_tb_randomx_top     := $(RTL_SRCS)
 
-TESTS := tb_blake2b tb_hbm_dataset_if tb_superscalar_hash tb_randomx_top
+TESTS := tb_blake2b tb_hbm_dataset_if tb_superscalar_hash tb_fpu_double tb_randomx_top
 
 .PHONY: all test lint syntax clean $(TESTS)
 
