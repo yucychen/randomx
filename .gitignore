@@ -1,0 +1,27 @@
+# Simulation artifacts
+*.vvp
+*.vcd
+*.fst
+*.lxt
+*.out
+sim/build/
+
+# Verilator artifacts
+obj_dir/
+*.verilator.log
+
+# Vivado artifacts
+vivado/build/
+*.jou
+*.log
+*.str
+.Xil/
+*.bit
+*.ltx
+*.rpt
+*.dcp
+
+# Editor / OS
+.DS_Store
+*.swp
+*~

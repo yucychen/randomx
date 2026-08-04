@@ -128,8 +128,13 @@ endfunction
 localparam ITEM_BITS      = 512;                         // 64-byte item
 localparam BEATS_PER_ITEM = ITEM_BITS / AXI_DATA_WIDTH;  // 2 for 256-bit HBM
 localparam BEAT_CNT_W     = (BEATS_PER_ITEM > 1) ? clog2(BEATS_PER_ITEM) : 1;
-localparam [7:0] BURST_LEN = BEATS_PER_ITEM - 1;         // arlen/awlen
-localparam [2:0] BEAT_SIZE = clog2(AXI_DATA_WIDTH/8);    // 5 → 32 bytes
+// Sized copies of the (32-bit) integer localparams above, so that every use
+// below is width-matched and lint-clean.
+localparam [31:0] BEATS_PER_ITEM_W = BEATS_PER_ITEM;
+localparam [31:0] BURST_LEN_W      = BEATS_PER_ITEM - 1;
+localparam [31:0] BEAT_SIZE_W      = clog2(AXI_DATA_WIDTH/8);
+localparam [7:0] BURST_LEN = BURST_LEN_W[7:0];           // arlen/awlen
+localparam [2:0] BEAT_SIZE = BEAT_SIZE_W[2:0];           // 5 → 32 bytes
 
 localparam [AXI_ADDR_WIDTH-1:0] BASE_ADDR = DATASET_BASE_ADDR;
 
@@ -403,7 +408,7 @@ always @(posedge clk or negedge rst_n) begin
             wbeat        <= {(BEAT_CNT_W+1){1'b0}};
         end else if (w_fire) begin
             m_axi_wdata  <= w_shift[AXI_DATA_WIDTH-1:0];
-            m_axi_wlast  <= ((wbeat + 1'b1) == BEATS_PER_ITEM);
+            m_axi_wlast  <= ((wbeat + 1'b1) == BEATS_PER_ITEM_W[BEAT_CNT_W:0]);
             w_shift      <= w_shift_nxt;
             wbeat        <= wbeat + 1'b1;
         end

@@ -37,6 +37,8 @@ randomx/
 ├── vivado/
 │   ├── build.tcl           # Vivado TCL 构建脚本（非项目模式）
 │   └── constraints.xdc     # 时序约束（300 MHz 时钟 + HBM 占位符）
+├── .github/workflows/ci.yml# CI：语法检查 + 全部 testbench + Verilator lint
+├── Makefile                # 编译 / 仿真 / lint 自动化
 └── README.md               # 本文档
 ```
 
@@ -261,7 +263,29 @@ sudo apt-get install iverilog
 brew install icarus-verilog
 ```
 
-### 编译与运行
+### 快速开始（推荐：Makefile）
+```bash
+make            # 编译并运行全部 testbench（任一 FAIL 则退出码非 0）
+make lint       # Verilator 静态检查（--lint-only -Wall）
+make syntax     # 逐模块 iverilog 语法检查
+make tb_blake2b # 只运行单个 testbench
+make clean      # 清理仿真产物
+```
+仿真产物统一输出到 `sim/build/`（已被 `.gitignore` 忽略），
+每个 testbench 的输出同时保存为 `sim/build/<name>.log`。
+
+### 持续集成（CI）
+`.github/workflows/ci.yml` 在每次 push / PR 时自动执行：
+
+| Job        | 内容                                              |
+|------------|---------------------------------------------------|
+| `simulate` | `make syntax` + `make test`（全部 testbench 自校验）|
+| `lint`     | `make lint`（Verilator `-Wall`）                   |
+
+`make test` 会检查每个 testbench 的输出中是否含 `FAIL` / `ERROR`，
+因此新增 testbench 时请沿用 `PASS` / `FAIL` 的打印约定。
+
+### 手动编译与运行（等价命令）
 ```bash
 # 仿真模式（缩减内存，快速仿真）
 iverilog -g2001 -DSIMULATION \
@@ -294,13 +318,17 @@ gtkwave tb_randomx_top.vcd
 
 ### 仅编译检查（无仿真）
 ```bash
-# 单独检查每个模块语法（-y rtl 让 iverilog 自动查找子模块，
-# 否则 randomx_top / randomx_vm / superscalar_hash / aes_* 会因缺少子模块而报错）
+make syntax
+# 等价于：
 for f in rtl/*.v; do
-    echo "Checking $f..."
-    iverilog -g2001 -DSIMULATION -y rtl -o /dev/null $f 2>&1 || echo "FAILED: $f"
+    iverilog -g2001 -DSIMULATION -y rtl -o /dev/null $f || echo "FAILED: $f"
 done
 ```
+
+### Lint 说明
+`make lint` 目前豁免了以下 Verilator 告警类别（均为骨架实现的已知状态，
+随着 TODO 模块补全应逐步取消豁免）：
+`DECLFILENAME`、`UNUSEDSIGNAL`、`UNUSEDPARAM`、`PINCONNECTEMPTY`、`UNDRIVEN`。
 
 ### 仿真说明
 - 使用 `-DSIMULATION` 宏时：
@@ -320,6 +348,15 @@ done
 | `sim/tb_hbm_dataset_if.v`  | 行为级 AXI4 从设备模型：多事务流水、背压、错误注入、AXI 属性与基址检查 | PASS |
 | `sim/tb_superscalar_hash.v`| 全部 14 种 SuperscalarHash 指令，与软件模型逐寄存器比对   | PASS（269 周期）|
 | `sim/tb_randomx_top.v`     | 顶层集成冒烟测试：寄存器写种子 → start → 轮询 done → 读回哈希；HBM 为 stub | 运行完成（非自校验）|
+
+> `make test` 会逐个运行上述 testbench，并在输出中出现 `FAIL` / `ERROR` 时返回非 0 退出码。
+
+### 验证方面的已知缺口
+- `tb_randomx_top.v` 尚非自校验：缺少与参考实现的期望哈希比对。
+- 尚无 testbench 覆盖：`aes_round` / `aes_gen1r` / `aes_gen4r` / `aes_hash1r`、
+  `alu_int`、`fpu_double`、`scratchpad_mem`、`argon2_fill`、`randomx_vm`。
+- 缺少与官方 [tevador/RandomX](https://github.com/tevador/RandomX) 参考实现的
+  端到端测试向量对拍（黄金模型对比）。
 
 ---
 
@@ -342,8 +379,31 @@ done
 
 ---
 
+## 完善路线图（优先级从高到低）
+
+1. **`fpu_double.v`** — 实现 IEEE 754 双精度 FADD/FSUB/FMUL（DSP48），
+   以及迭代式 FDIV/FSQRT，并支持 4 种舍入模式。当前实现返回占位值，
+   哈希结果必然不正确。
+2. **`argon2_fill.v`** — Argon2d G 压缩函数、数据相关参考块选择、
+   多 pass 支持、Blake2b 变长输出（H'），并接到真实 cache 存储。
+3. **`randomx_vm.v`** — 29 条 ISA 完整译码、CFROUND、L1/L2/L3 地址掩码、
+   浮点寄存器前递、Dataset 取数与 MX/MA 更新、程序结束的 Scratchpad XOR + AesHash1R。
+4. **`randomx_top.v`** — 打通 DS_GEN（SuperscalarHash 8 pass）与 FINAL_HASH，
+   驱动 HBM 写通道，修正 `key_len` 编码（6 bit 无法表示 64 字节）。
+5. **AES 轮密钥** — `aes_gen1r` / `aes_gen4r` / `aes_hash1r` 中的常量目前为占位值，
+   需按 spec 3.3/3.4 从种子派生。
+6. **`alu_int.v` IMUL_RCP** — 2^128 / b 倒数计算。
+7. **验证** — 补齐单元 testbench，并与参考实现做端到端向量对拍。
+8. **后端** — `constraints.xdc` 中的 `PIN_NAME` 占位符、HBM 参考时钟约束、
+   跨时钟域约束；`build.tcl` 中实例化 Vivado HBM IP；验证 300 MHz 时序收敛与资源占用。
+
+---
+
 ## 许可
 
 本项目为开源硬件框架骨架，用于 RandomX 算法的 FPGA 研究目的。
 
-RandomX 算法版权归原始作者所有（见 [tevador/RandomX](https://github.com/tevador/RandomX)）。
+RandomX 算法版权归原始作者所有（见 [tevador/RandomX](https://github.com/tevador/RandomX)，BSD-3-Clause）。
+
+> **待办**：仓库尚未包含 `LICENSE` 文件。请仓库所有者选定并添加正式许可证
+> （建议与上游 RandomX 兼容，例如 BSD-3-Clause）。
