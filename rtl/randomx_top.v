@@ -97,10 +97,12 @@ reg [3:0] fsm_state;
 // --- Argon2d ---
 wire        argon2_done;
 reg         argon2_start;
-// Cache write interface (stub — no physical cache here, forwarded to HBM)
-wire        argon2_cache_wr_en;
-wire [31:0] argon2_cache_wr_addr;
-wire [1023:0] argon2_cache_wr_data;
+// Cache access interface (stub — no physical cache here, forwarded to HBM)
+wire         argon2_cache_wr_en;
+wire [31:0]  argon2_cache_wr_addr;
+wire [8191:0] argon2_cache_wr_data;
+wire         argon2_cache_rd_en;
+wire [31:0]  argon2_cache_rd_addr;
 
 // Blake2b (shared between argon2 and final hash)
 wire        b2b_done;
@@ -167,11 +169,15 @@ argon2_fill u_argon2 (
     .rst_n          (rst_n),
     .start          (argon2_start),
     .key            (seed_reg),
-    .key_len        (6'd63),    // 64 bytes = all bits (6-bit max 63, TODO: fix key_len encoding)
+    .key_len        (7'd64),    // seed is a full 64-byte key
     .cache_wr_en    (argon2_cache_wr_en),
     .cache_wr_addr  (argon2_cache_wr_addr),
     .cache_wr_data  (argon2_cache_wr_data),
-    .cache_wr_rdy   (1'b1),    // TODO: Connect to actual cache (HBM)
+    .cache_wr_rdy   (1'b1),      // TODO: Connect to actual cache (HBM)
+    .cache_rd_en    (argon2_cache_rd_en),
+    .cache_rd_addr  (argon2_cache_rd_addr),
+    .cache_rd_data  ({8192{1'b0}}), // TODO: Connect to actual cache (HBM)
+    .cache_rd_valid (1'b1),
     .done           (argon2_done),
     .b2b_start      (b2b_start),
     .b2b_init       (b2b_init),

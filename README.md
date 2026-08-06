@@ -28,7 +28,7 @@ randomx/
 │   ├── fpu_double.v        # 双精度浮点单元（IEEE 754 加/减/乘/除/开方 + FSCAL/FSWAP）
 │   ├── scratchpad_mem.v    # 2 MiB Scratchpad（URAM 推断，L1/L2/L3 掩码）
 │   ├── hbm_dataset_if.v    # HBM2 AXI4 主设备接口（数据集读写，流水化）
-│   └── argon2_fill.v       # Argon2d Cache 填充骨架（基于 Blake2b）
+│   └── argon2_fill.v       # Argon2d Cache 填充（基于 Blake2b，已实现）
 ├── sim/
 │   ├── tb_randomx_top.v    # 基础功能仿真 testbench
 │   ├── tb_blake2b.v        # Blake2b-512 参考测试向量 testbench（含多块/busy）
@@ -206,11 +206,29 @@ randomx/
 - 单元测试：`sim/tb_superscalar_hash.v`（覆盖全部 14 种指令，比对软件模型结果）
 - **TODO**：超标量调度（并行执行端口，仅影响吞吐量，结果不变）
 
-### `argon2_fill.v` — Argon2d Cache 填充骨架
-- 状态机：IDLE → H0 → INIT_BLK → FILL → COMPRESS → WRITE → DONE
-- 连接共享的 Blake2b 核用于块压缩：H0 计算使用 `b2b_init`（由核内部生成参数块 IV），
-  块压缩阶段改用 `b2b_h_in` 传入链值
-- **TODO**：完整 Argon2d G 函数、数据相关的参考块选择、变长哈希（H'）、多轮（t>1）
+### `argon2_fill.v` — Argon2d Cache 填充
+- 完整实现 RandomX 所用的 Argon2d（version 0x13，type=Argon2d，lanes=1，
+  t=3，m=262144 块，salt = `"RandomX\x03"`，不产生最终 tag）：
+  1. `H0 = Blake2b-512(LE32(lanes) || LE32(tagLen) || LE32(m) || LE32(t) ||
+     LE32(version) || LE32(type) || LE32(|K|) || K || LE32(|S|) || S ||
+     LE32(0) || LE32(0))`
+  2. `B[0] = H'(1024, H0 || LE32(0) || LE32(lane))`、
+     `B[1] = H'(1024, H0 || LE32(1) || LE32(lane))`，
+     其中 H' 为 Argon2 变长哈希（31 次 Blake2b-512 链式调用）
+  3. 数据相关（Argon2d）参考块选择：由前一块的第 0 个 LE32 字 J1 计算
+     `ref_area / relative_position / start_position`，与参考实现
+     `index_alpha()` 位级一致
+  4. 压缩函数 G：`R = B[i-1] ^ B[ref]`，对 R 的 8 个 128 字节行做 P 置换，
+     再对 8 个列做 P 置换，`B[i] = Z ^ R`；t>1 时为 XOR 模式 `B[i] ^= Z ^ R`
+  5. P 为 Argon2 BlaMka 置换（带 64 位乘加的 Blake2b 轮函数），
+     每半轮 4 个 G_B 并行，一个块共 16 轮 × 2 = 32 周期
+- 状态机：IDLE → H0 → HP_FIRST → HP_NEXT → HP_WRITE →
+  RD_PREV → RD_REF →（t>1 时 RD_CUR）→ ROUNDS → WRITE → DONE
+- 接口：共享 Blake2b 核（`b2b_*`）+ 1 KiB 位宽的 cache 读写端口
+  （按块索引寻址，面向外部 URAM/HBM 存储）
+- 成本参数 `ARGON_M` / `ARGON_T` 可通过 parameter 覆盖（仿真时默认缩减为 8 块）
+- 单元测试：`sim/tb_argon2_fill.v`，与 Argon2 参考实现生成的黄金向量逐块比对
+- **TODO**：接到真实 cache 存储（`randomx_top.v` 中的 cache 端口目前仍为占位）
 
 ---
 
@@ -315,6 +333,11 @@ iverilog -g2001 -o sim/tb_hbm_dataset_if.vvp \
     rtl/hbm_dataset_if.v sim/tb_hbm_dataset_if.v
 vvp sim/tb_hbm_dataset_if.vvp   # 输出 PASS
 
+# Argon2d Cache 填充单元测试（与 Argon2 参考实现黄金向量比对）
+iverilog -g2001 -DSIMULATION -o sim/tb_argon2_fill.vvp \
+    rtl/blake2b_core.v rtl/argon2_fill.v sim/tb_argon2_fill.v
+vvp sim/tb_argon2_fill.vvp   # 输出 ALL TESTS PASSED（需在仓库根目录运行）
+
 # SuperscalarHash 单元测试（全指令集，比对软件模型）
 iverilog -g2001 -o sim/tb_superscalar_hash.vvp \
     rtl/alu_int.v rtl/superscalar_hash.v sim/tb_superscalar_hash.v
@@ -356,6 +379,7 @@ done
 | `sim/tb_hbm_dataset_if.v`  | 行为级 AXI4 从设备模型：多事务流水、背压、错误注入、AXI 属性与基址检查 | PASS |
 | `sim/tb_superscalar_hash.v`| 全部 14 种 SuperscalarHash 指令，与软件模型逐寄存器比对   | PASS（269 周期）|
 | `sim/tb_fpu_double.v`      | FADD/FSUB/FMUL/FDIV/FSQRT/FSCAL/FSWAP，含 4 种舍入模式、NaN/Inf/±0、非规格化、上溢/下溢与 `busy` 握手 | PASS（47 项检查）|
+| `sim/tb_argon2_fill.v`     | Argon2d Cache 填充：与 Argon2 参考实现黄金向量逐块比对（m=8/t=3/43 字节 key，m=32/t=1/64 字节 key） | PASS |
 | `sim/tb_randomx_top.v`     | 顶层集成冒烟测试：寄存器写种子 → start → 轮询 done → 读回哈希；HBM 为 stub | 运行完成（非自校验）|
 
 > `make test` 会逐个运行上述 testbench，并在输出中出现 `FAIL` / `ERROR` 时返回非 0 退出码。
@@ -363,7 +387,7 @@ done
 ### 验证方面的已知缺口
 - `tb_randomx_top.v` 尚非自校验：缺少与参考实现的期望哈希比对。
 - 尚无 testbench 覆盖：`aes_round` / `aes_gen1r` / `aes_gen4r` / `aes_hash1r`、
-  `alu_int`、`scratchpad_mem`、`argon2_fill`、`randomx_vm`。
+  `alu_int`、`scratchpad_mem`、`randomx_vm`。
 - 缺少与官方 [tevador/RandomX](https://github.com/tevador/RandomX) 参考实现的
   端到端测试向量对拍（黄金模型对比）。
 
@@ -384,18 +408,18 @@ done
 | fpu_double.v     | **已实现** | 流水化以提升 Fmax（当前加/乘为单周期组合路径）|
 | superscalar_hash.v| **已实现** | 超标量调度（并行执行端口，性能优化）        |
 | randomx_vm.v     | 骨架       | 完整指令译码、内存地址计算、CFROUND         |
-| argon2_fill.v    | 骨架       | G 函数、数据相关参考块选择、变长哈希、多轮支持 |
+| argon2_fill.v    | **已实现** | 接到真实 cache 存储（HBM/URAM） |
 
 ---
 
 ## 完善路线图（优先级从高到低）
 
-1. **`argon2_fill.v`** — Argon2d G 压缩函数、数据相关参考块选择、
-   多 pass 支持、Blake2b 变长输出（H'），并接到真实 cache 存储。
+1. **Cache 存储** — 将 `argon2_fill.v` 的 1 KiB 块读写端口接到真实的
+   cache 存储（HBM 或大容量 URAM），目前 `randomx_top.v` 中仍为占位连接。
 2. **`randomx_vm.v`** — 29 条 ISA 完整译码、CFROUND、L1/L2/L3 地址掩码、
    浮点寄存器前递、Dataset 取数与 MX/MA 更新、程序结束的 Scratchpad XOR + AesHash1R。
 3. **`randomx_top.v`** — 打通 DS_GEN（SuperscalarHash 8 pass）与 FINAL_HASH，
-   驱动 HBM 写通道，修正 `key_len` 编码（6 bit 无法表示 64 字节）。
+   驱动 HBM 写通道。
 4. **AES 轮密钥** — `aes_gen1r` / `aes_gen4r` / `aes_hash1r` 中的常量目前为占位值，
    需按 spec 3.3/3.4 从种子派生。
 5. **`alu_int.v` IMUL_RCP** — 2^128 / b 倒数计算。
