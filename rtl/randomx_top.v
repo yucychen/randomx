@@ -97,12 +97,15 @@ reg [3:0] fsm_state;
 // --- Argon2d ---
 wire        argon2_done;
 reg         argon2_start;
-// Cache access interface (stub — no physical cache here, forwarded to HBM)
+// Cache access interface (1 KiB blocks, stored in HBM via cache_hbm_if)
 wire         argon2_cache_wr_en;
 wire [31:0]  argon2_cache_wr_addr;
 wire [8191:0] argon2_cache_wr_data;
+wire         argon2_cache_wr_rdy;
 wire         argon2_cache_rd_en;
 wire [31:0]  argon2_cache_rd_addr;
+wire [8191:0] argon2_cache_rd_data;
+wire         argon2_cache_rd_valid;
 
 // Blake2b (shared between argon2 and final hash)
 wire        b2b_done;
@@ -173,11 +176,11 @@ argon2_fill u_argon2 (
     .cache_wr_en    (argon2_cache_wr_en),
     .cache_wr_addr  (argon2_cache_wr_addr),
     .cache_wr_data  (argon2_cache_wr_data),
-    .cache_wr_rdy   (1'b1),      // TODO: Connect to actual cache (HBM)
+    .cache_wr_rdy   (argon2_cache_wr_rdy),
     .cache_rd_en    (argon2_cache_rd_en),
     .cache_rd_addr  (argon2_cache_rd_addr),
-    .cache_rd_data  ({8192{1'b0}}), // TODO: Connect to actual cache (HBM)
-    .cache_rd_valid (1'b1),
+    .cache_rd_data  (argon2_cache_rd_data),
+    .cache_rd_valid (argon2_cache_rd_valid),
     .done           (argon2_done),
     .b2b_start      (b2b_start),
     .b2b_init       (b2b_init),
@@ -205,13 +208,110 @@ scratchpad_mem u_scratchpad (
     .rd_valid (sp_rd_valid)
 );
 
-// --- HBM AXI4 master interface ---
+// ===========================================================================
+// HBM address map (34-bit byte addresses inside the 8 GB HBM stack)
+//   0x0_0000_0000 .. 0x0_8500_0000 : Dataset (~2.08 GiB, 64-byte items)
+//   0x0_C000_0000 .. 0x0_D000_0000 : Argon2d Cache (256 MiB, 1 KiB blocks)
+// Both regions are accessed through one AXI4 port, shared by an arbiter.
+// ===========================================================================
+localparam DATASET_BASE = 34'h0_0000_0000;
+localparam CACHE_BASE   = 34'h0_C000_0000;
+
+// --- Cache storage (Argon2d 1 KiB blocks, backed by HBM) ---
+wire cache_axi_err; // sticky AXI error status from the cache interface
+
+wire [33:0]  c_axi_araddr;
+wire [7:0]   c_axi_arlen;
+wire [2:0]   c_axi_arsize;
+wire [1:0]   c_axi_arburst;
+wire         c_axi_arvalid, c_axi_arready;
+wire [255:0] c_axi_rdata;
+wire [1:0]   c_axi_rresp;
+wire         c_axi_rlast, c_axi_rvalid, c_axi_rready;
+wire [33:0]  c_axi_awaddr;
+wire [7:0]   c_axi_awlen;
+wire [2:0]   c_axi_awsize;
+wire [1:0]   c_axi_awburst;
+wire         c_axi_awvalid, c_axi_awready;
+wire [255:0] c_axi_wdata;
+wire [31:0]  c_axi_wstrb;
+wire         c_axi_wlast, c_axi_wvalid, c_axi_wready;
+wire [1:0]   c_axi_bresp;
+wire         c_axi_bvalid, c_axi_bready;
+
+cache_hbm_if #(
+    .AXI_ADDR_WIDTH  (34),
+    .AXI_DATA_WIDTH  (256),
+    .AXI_ID_WIDTH    (6),
+    .CACHE_BASE_ADDR (CACHE_BASE)
+) u_cache (
+    .clk            (clk),
+    .rst_n          (rst_n),
+    .wr_en          (argon2_cache_wr_en),
+    .wr_addr        (argon2_cache_wr_addr),
+    .wr_data        (argon2_cache_wr_data),
+    .wr_rdy         (argon2_cache_wr_rdy),
+    .rd_en          (argon2_cache_rd_en),
+    .rd_addr        (argon2_cache_rd_addr),
+    .rd_data        (argon2_cache_rd_data),
+    .rd_valid       (argon2_cache_rd_valid),
+    .axi_err        (cache_axi_err),
+    .m_axi_arid     (),                // ID not connected to top
+    .m_axi_araddr   (c_axi_araddr),
+    .m_axi_arlen    (c_axi_arlen),
+    .m_axi_arsize   (c_axi_arsize),
+    .m_axi_arburst  (c_axi_arburst),
+    .m_axi_arvalid  (c_axi_arvalid),
+    .m_axi_arready  (c_axi_arready),
+    .m_axi_rdata    (c_axi_rdata),
+    .m_axi_rresp    (c_axi_rresp),
+    .m_axi_rlast    (c_axi_rlast),
+    .m_axi_rvalid   (c_axi_rvalid),
+    .m_axi_rready   (c_axi_rready),
+    .m_axi_awid     (),
+    .m_axi_awaddr   (c_axi_awaddr),
+    .m_axi_awlen    (c_axi_awlen),
+    .m_axi_awsize   (c_axi_awsize),
+    .m_axi_awburst  (c_axi_awburst),
+    .m_axi_awvalid  (c_axi_awvalid),
+    .m_axi_awready  (c_axi_awready),
+    .m_axi_wdata    (c_axi_wdata),
+    .m_axi_wstrb    (c_axi_wstrb),
+    .m_axi_wlast    (c_axi_wlast),
+    .m_axi_wvalid   (c_axi_wvalid),
+    .m_axi_wready   (c_axi_wready),
+    .m_axi_bresp    (c_axi_bresp),
+    .m_axi_bvalid   (c_axi_bvalid),
+    .m_axi_bready   (c_axi_bready)
+);
+
+// --- HBM AXI4 master interface (dataset) ---
 wire hbm_axi_err;   // sticky AXI error status from the dataset interface
 
+wire [33:0]  d_axi_araddr;
+wire [7:0]   d_axi_arlen;
+wire [2:0]   d_axi_arsize;
+wire [1:0]   d_axi_arburst;
+wire         d_axi_arvalid, d_axi_arready;
+wire [255:0] d_axi_rdata;
+wire [1:0]   d_axi_rresp;
+wire         d_axi_rlast, d_axi_rvalid, d_axi_rready;
+wire [33:0]  d_axi_awaddr;
+wire [7:0]   d_axi_awlen;
+wire [2:0]   d_axi_awsize;
+wire [1:0]   d_axi_awburst;
+wire         d_axi_awvalid, d_axi_awready;
+wire [255:0] d_axi_wdata;
+wire [31:0]  d_axi_wstrb;
+wire         d_axi_wlast, d_axi_wvalid, d_axi_wready;
+wire [1:0]   d_axi_bresp;
+wire         d_axi_bvalid, d_axi_bready;
+
 hbm_dataset_if #(
-    .AXI_ADDR_WIDTH (34),
-    .AXI_DATA_WIDTH (256),
-    .AXI_ID_WIDTH   (6)
+    .AXI_ADDR_WIDTH    (34),
+    .AXI_DATA_WIDTH    (256),
+    .AXI_ID_WIDTH      (6),
+    .DATASET_BASE_ADDR (DATASET_BASE)
 ) u_hbm (
     .clk            (clk),
     .rst_n          (rst_n),
@@ -230,34 +330,119 @@ hbm_dataset_if #(
     .wr_err         (),
     .axi_err        (hbm_axi_err),
     .m_axi_arid     (),                // ID not connected to top
-    .m_axi_araddr   (m_axi_araddr),
-    .m_axi_arlen    (m_axi_arlen),
-    .m_axi_arsize   (m_axi_arsize),
-    .m_axi_arburst  (m_axi_arburst),
-    .m_axi_arvalid  (m_axi_arvalid),
-    .m_axi_arready  (m_axi_arready),
+    .m_axi_araddr   (d_axi_araddr),
+    .m_axi_arlen    (d_axi_arlen),
+    .m_axi_arsize   (d_axi_arsize),
+    .m_axi_arburst  (d_axi_arburst),
+    .m_axi_arvalid  (d_axi_arvalid),
+    .m_axi_arready  (d_axi_arready),
     .m_axi_rid      (6'b0),
-    .m_axi_rdata    (m_axi_rdata),
-    .m_axi_rresp    (m_axi_rresp),
-    .m_axi_rlast    (m_axi_rlast),
-    .m_axi_rvalid   (m_axi_rvalid),
-    .m_axi_rready   (m_axi_rready),
+    .m_axi_rdata    (d_axi_rdata),
+    .m_axi_rresp    (d_axi_rresp),
+    .m_axi_rlast    (d_axi_rlast),
+    .m_axi_rvalid   (d_axi_rvalid),
+    .m_axi_rready   (d_axi_rready),
     .m_axi_awid     (),
-    .m_axi_awaddr   (m_axi_awaddr),
-    .m_axi_awlen    (m_axi_awlen),
-    .m_axi_awsize   (m_axi_awsize),
-    .m_axi_awburst  (m_axi_awburst),
-    .m_axi_awvalid  (m_axi_awvalid),
-    .m_axi_awready  (m_axi_awready),
-    .m_axi_wdata    (m_axi_wdata),
-    .m_axi_wstrb    (m_axi_wstrb),
-    .m_axi_wlast    (m_axi_wlast),
-    .m_axi_wvalid   (m_axi_wvalid),
-    .m_axi_wready   (m_axi_wready),
+    .m_axi_awaddr   (d_axi_awaddr),
+    .m_axi_awlen    (d_axi_awlen),
+    .m_axi_awsize   (d_axi_awsize),
+    .m_axi_awburst  (d_axi_awburst),
+    .m_axi_awvalid  (d_axi_awvalid),
+    .m_axi_awready  (d_axi_awready),
+    .m_axi_wdata    (d_axi_wdata),
+    .m_axi_wstrb    (d_axi_wstrb),
+    .m_axi_wlast    (d_axi_wlast),
+    .m_axi_wvalid   (d_axi_wvalid),
+    .m_axi_wready   (d_axi_wready),
     .m_axi_bid      (6'b0),
-    .m_axi_bresp    (m_axi_bresp),
-    .m_axi_bvalid   (m_axi_bvalid),
-    .m_axi_bready   (m_axi_bready)
+    .m_axi_bresp    (d_axi_bresp),
+    .m_axi_bvalid   (d_axi_bvalid),
+    .m_axi_bready   (d_axi_bready)
+);
+
+// --- AXI arbiter: cache (M0) + dataset (M1) share the single HBM port ---
+axi_arbiter #(
+    .AXI_ADDR_WIDTH  (34),
+    .AXI_DATA_WIDTH  (256),
+    .MAX_OUTSTANDING (16)
+) u_axi_arb (
+    .clk        (clk),
+    .rst_n      (rst_n),
+    .m0_araddr  (c_axi_araddr),
+    .m0_arlen   (c_axi_arlen),
+    .m0_arsize  (c_axi_arsize),
+    .m0_arburst (c_axi_arburst),
+    .m0_arvalid (c_axi_arvalid),
+    .m0_arready (c_axi_arready),
+    .m0_rdata   (c_axi_rdata),
+    .m0_rresp   (c_axi_rresp),
+    .m0_rlast   (c_axi_rlast),
+    .m0_rvalid  (c_axi_rvalid),
+    .m0_rready  (c_axi_rready),
+    .m0_awaddr  (c_axi_awaddr),
+    .m0_awlen   (c_axi_awlen),
+    .m0_awsize  (c_axi_awsize),
+    .m0_awburst (c_axi_awburst),
+    .m0_awvalid (c_axi_awvalid),
+    .m0_awready (c_axi_awready),
+    .m0_wdata   (c_axi_wdata),
+    .m0_wstrb   (c_axi_wstrb),
+    .m0_wlast   (c_axi_wlast),
+    .m0_wvalid  (c_axi_wvalid),
+    .m0_wready  (c_axi_wready),
+    .m0_bresp   (c_axi_bresp),
+    .m0_bvalid  (c_axi_bvalid),
+    .m0_bready  (c_axi_bready),
+    .m1_araddr  (d_axi_araddr),
+    .m1_arlen   (d_axi_arlen),
+    .m1_arsize  (d_axi_arsize),
+    .m1_arburst (d_axi_arburst),
+    .m1_arvalid (d_axi_arvalid),
+    .m1_arready (d_axi_arready),
+    .m1_rdata   (d_axi_rdata),
+    .m1_rresp   (d_axi_rresp),
+    .m1_rlast   (d_axi_rlast),
+    .m1_rvalid  (d_axi_rvalid),
+    .m1_rready  (d_axi_rready),
+    .m1_awaddr  (d_axi_awaddr),
+    .m1_awlen   (d_axi_awlen),
+    .m1_awsize  (d_axi_awsize),
+    .m1_awburst (d_axi_awburst),
+    .m1_awvalid (d_axi_awvalid),
+    .m1_awready (d_axi_awready),
+    .m1_wdata   (d_axi_wdata),
+    .m1_wstrb   (d_axi_wstrb),
+    .m1_wlast   (d_axi_wlast),
+    .m1_wvalid  (d_axi_wvalid),
+    .m1_wready  (d_axi_wready),
+    .m1_bresp   (d_axi_bresp),
+    .m1_bvalid  (d_axi_bvalid),
+    .m1_bready  (d_axi_bready),
+    .s_araddr   (m_axi_araddr),
+    .s_arlen    (m_axi_arlen),
+    .s_arsize   (m_axi_arsize),
+    .s_arburst  (m_axi_arburst),
+    .s_arvalid  (m_axi_arvalid),
+    .s_arready  (m_axi_arready),
+    .s_rdata    (m_axi_rdata),
+    .s_rresp    (m_axi_rresp),
+    .s_rlast    (m_axi_rlast),
+    .s_rvalid   (m_axi_rvalid),
+    .s_rready   (m_axi_rready),
+    .s_awaddr   (m_axi_awaddr),
+    .s_awlen    (m_axi_awlen),
+    .s_awsize   (m_axi_awsize),
+    .s_awburst  (m_axi_awburst),
+    .s_awvalid  (m_axi_awvalid),
+    .s_awready  (m_axi_awready),
+    .s_wdata    (m_axi_wdata),
+    .s_wstrb    (m_axi_wstrb),
+    .s_wlast    (m_axi_wlast),
+    .s_wvalid   (m_axi_wvalid),
+    .s_wready   (m_axi_wready),
+    .s_bresp    (m_axi_bresp),
+    .s_bvalid   (m_axi_bvalid),
+    .s_bready   (m_axi_bready)
 );
 
 // --- AesHash1R ---
@@ -346,7 +531,7 @@ always @(posedge clk or negedge rst_n) begin
     end else if (reg_rd_en) begin
         casez (reg_rd_addr)
             // Status: 0x44
-            8'h44: reg_rd_data <= {30'b0, hbm_axi_err, ~busy};
+            8'h44: reg_rd_data <= {30'b0, hbm_axi_err | cache_axi_err, ~busy};
             // Hash output: 0x48..0x64 (8 × 32-bit)
             8'h48: reg_rd_data <= hash_out[ 31:  0];
             8'h4C: reg_rd_data <= hash_out[ 63: 32];

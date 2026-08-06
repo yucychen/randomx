@@ -40,6 +40,8 @@ set rtl_files [list \
     "${rtl_dir}/blake2b_core.v"    \
     "${rtl_dir}/scratchpad_mem.v"  \
     "${rtl_dir}/hbm_dataset_if.v"  \
+    "${rtl_dir}/cache_hbm_if.v"    \
+    "${rtl_dir}/axi_arbiter.v"     \
     "${rtl_dir}/alu_int.v"         \
     "${rtl_dir}/fpu_double.v"      \
     "${rtl_dir}/superscalar_hash.v"\

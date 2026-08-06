@@ -26,6 +26,8 @@ RTL_SRCS := \
 	$(RTL_DIR)/blake2b_core.v \
 	$(RTL_DIR)/scratchpad_mem.v \
 	$(RTL_DIR)/hbm_dataset_if.v \
+	$(RTL_DIR)/cache_hbm_if.v \
+	$(RTL_DIR)/axi_arbiter.v \
 	$(RTL_DIR)/alu_int.v \
 	$(RTL_DIR)/fpu_double.v \
 	$(RTL_DIR)/superscalar_hash.v \
@@ -36,13 +38,14 @@ RTL_SRCS := \
 # 每个 testbench 需要的 RTL 子集
 SRCS_tb_blake2b         := $(RTL_DIR)/blake2b_core.v
 SRCS_tb_hbm_dataset_if  := $(RTL_DIR)/hbm_dataset_if.v
+SRCS_tb_cache_hbm_if    := $(RTL_DIR)/cache_hbm_if.v
 SRCS_tb_superscalar_hash:= $(RTL_DIR)/alu_int.v $(RTL_DIR)/superscalar_hash.v
 SRCS_tb_fpu_double      := $(RTL_DIR)/fpu_double.v
 SRCS_tb_argon2_fill     := $(RTL_DIR)/blake2b_core.v $(RTL_DIR)/argon2_fill.v
 SRCS_tb_randomx_top     := $(RTL_SRCS)
 
-TESTS := tb_blake2b tb_hbm_dataset_if tb_superscalar_hash tb_fpu_double \
-         tb_argon2_fill tb_randomx_top
+TESTS := tb_blake2b tb_hbm_dataset_if tb_cache_hbm_if tb_superscalar_hash \
+         tb_fpu_double tb_argon2_fill tb_randomx_top
 
 .PHONY: all test lint syntax clean $(TESTS)
 

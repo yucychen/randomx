@@ -4,7 +4,8 @@
 
 > **状态：部分实现**  
 > 所有模块均可使用 `iverilog -g2001` 编译并通过仿真。
-> `blake2b_core` / `aes_round` / `scratchpad_mem` / `hbm_dataset_if` / `superscalar_hash` / `fpu_double`
+> `blake2b_core` / `aes_round` / `scratchpad_mem` / `hbm_dataset_if` / `cache_hbm_if` /
+> `axi_arbiter` / `superscalar_hash` / `fpu_double` / `argon2_fill`
 > 已完整实现并有单元测试覆盖（见 [单元测试状态](#单元测试状态)）；
 > 其余模块为骨架，功能逻辑以 `TODO` 注释标注，待完整实现。
 
@@ -28,11 +29,16 @@ randomx/
 │   ├── fpu_double.v        # 双精度浮点单元（IEEE 754 加/减/乘/除/开方 + FSCAL/FSWAP）
 │   ├── scratchpad_mem.v    # 2 MiB Scratchpad（URAM 推断，L1/L2/L3 掩码）
 │   ├── hbm_dataset_if.v    # HBM2 AXI4 主设备接口（数据集读写，流水化）
+│   ├── cache_hbm_if.v      # Argon2d Cache 存储接口（1 KiB 块 ↔ AXI4 突发）
+│   ├── axi_arbiter.v       # 2 主设备 AXI4 仲裁器（cache + dataset 共享 HBM 端口）
 │   └── argon2_fill.v       # Argon2d Cache 填充（基于 Blake2b，已实现）
 ├── sim/
 │   ├── tb_randomx_top.v    # 基础功能仿真 testbench
 │   ├── tb_blake2b.v        # Blake2b-512 参考测试向量 testbench（含多块/busy）
 │   ├── tb_hbm_dataset_if.v # HBM AXI4 接口 testbench（含 AXI 从设备模型）
+│   ├── tb_cache_hbm_if.v   # Cache 存储接口 testbench（含 AXI 从设备模型）
+│   ├── tb_argon2_fill.v    # Argon2d 填充 testbench（黄金向量比对）
+│   ├── tb_fpu_double.v     # 双精度浮点单元 testbench
 │   └── tb_superscalar_hash.v # SuperscalarHash 全指令集 testbench
 ├── vivado/
 │   ├── build.tcl           # Vivado TCL 构建脚本（非项目模式）
@@ -70,9 +76,14 @@ randomx/
                         │  └────────────────────────────────────────────┘  │
                         │                                                   │
                         │  ┌────────────────────────────────────────────┐  │
-                        │  │   hbm_dataset_if (AXI4 主设备)              │  │──► HBM2 AXI
-                        │  │   Dataset (~2GB) 存于 XCVU33P 8GB HBM2     │  │    接口
-                        │  └────────────────────────────────────────────┘  │
+                        │  │   cache_hbm_if (AXI4 主设备)                │  │
+                        │  │   Cache (256MB, 1KiB 块) 存于 HBM2         │  │
+                        │  ├────────────────────────────────────────────┤  │
+                        │  │   hbm_dataset_if (AXI4 主设备)              │  │
+                        │  │   Dataset (~2GB) 存于 XCVU33P 8GB HBM2     │  │
+                        │  ├────────────────────────────────────────────┤  │
+                        │  │   axi_arbiter (2 主设备 → 1 HBM 端口)       │  │──► HBM2 AXI
+                        │  └────────────────────────────────────────────┘  │    接口
                         │                                                   │
                         │  AES流水线：aes_round ─► aes_gen1r/4r/hash1r    │
                         └─────────────────────────────────────────────────┘
@@ -89,7 +100,7 @@ randomx/
     │
     ▼
 [1] Argon2d Cache 填充 (argon2_fill.v)
-    256 MB Cache = 262144 × 1KB 块
+    256 MB Cache = 262144 × 1KB 块，存于 HBM2 (cache_hbm_if.v)
     使用 Blake2b 压缩函数填充
     │
     ▼
@@ -127,6 +138,14 @@ randomx/
   | 0x44    | 读   | 状态寄存器（bit0=done/~busy，bit1=HBM AXI 错误粘滞位） |
   | 0x48~0x84 | 读 | 哈希输出（512位，16×32位）   |
 - **主 FSM**：IDLE → CACHE_INIT → VM_RUN → FINAL_HASH → DONE
+- **HBM 地址映射**（34 位字节地址，8 GB HBM 堆栈）：
+
+  | 区域    | 基址            | 大小      | 访问模块          |
+  |---------|-----------------|-----------|-------------------|
+  | Dataset | `0x0_0000_0000` | ~2.08 GiB | `hbm_dataset_if.v`|
+  | Cache   | `0x0_C000_0000` | 256 MiB   | `cache_hbm_if.v`  |
+
+  两个主设备通过 `axi_arbiter.v` 共享同一个 AXI4 端口
 - **TODO**：DS_GEN 阶段、完整 AXI-Lite 握手
 
 ### `blake2b_core.v` — Blake2b-512 压缩核（**已完成**）
@@ -172,6 +191,30 @@ randomx/
 - 单元测试：`sim/tb_hbm_dataset_if.v`（行为级 AXI 从设备模型，含多事务流水、
   背压、错误注入、AXI 属性与基址检查）
 - **TODO**：连接到 Vivado HBM IP；将写接口接到 superscalar_hash
+
+### `cache_hbm_if.v` — Argon2d Cache 存储接口（**已实现**）
+- Cache 为 262144 × 1 KiB = 256 MiB，远超 XCVU33P 片上 URAM（约 1.4 MiB），
+  因此与 Dataset 一样存放在 HBM2 中；本模块把 `argon2_fill.v` 的 1 KiB 块端口
+  转换成 256-bit HBM 伪通道上的 AXI4 突发
+- 每块 = 1024 字节 / 32 字节每拍 = **32 拍突发**（`awlen/arlen = 31`）；
+  字节地址 = `CACHE_BASE_ADDR + 块号 × 1024`，基址 1 KiB 对齐 ⇒ 突发不跨 4 KiB 边界
+- 块端口握手与 `argon2_fill.v` 一致：写侧保持 `wr_en` 直到 `wr_rdy` 单周期脉冲
+  （此时整块已写入 HBM），读侧保持 `rd_en` 直到 `rd_valid` 与整块数据同时给出；
+  一次只服务一笔事务，且必须等 `*_en` 撤销后才采样下一次请求，
+  因此持续拉高的 enable 不会被误判为第二次请求
+- 字节序与 `argon2_fill` / `hbm_dataset_if` 一致：块位 `[8*k +: 8]` 即块内第 k 字节，
+  首拍携带第 0..31 字节
+- 错误处理：`RRESP`/`BRESP` 异常置粘滞位 `axi_err`，汇总到顶层状态寄存器 bit1
+- 单元测试：`sim/tb_cache_hbm_if.v`（行为级 AXI 从设备模型，含随机背压、
+  字节序检查、握手复用检查与 SLVERR 注入）
+
+### `axi_arbiter.v` — 2 主设备 AXI4 仲裁器（**已实现**）
+- HBM 伪通道只有一个 AXI4 从端口，而 cache（M0）与 dataset（M1）都要访问它
+- 读/写通路独立仲裁；授权是排他的：某主设备仍有未完成事务时另一方不能发地址，
+  因此可按记录的 owner 路由 R/B 响应（两个主设备均使用 AXI ID 0，
+  排他授权正是其“响应保序”假设成立的前提）
+- 通道空闲时按 round-robin 选择请求方（上次被授权者优先级更低），避免饿死
+- W 通道跟随写地址 owner，保证 W 突发与被接受的 AW 属于同一主设备
 
 ### `alu_int.v` — 整数执行单元
 - 完整 RandomX 整数 ISA：IADD_RS, ISUB, IMUL, IMULH, ISMULH, INEG, IXOR, IROR/IROL, ISWAP, CBRANCH, ISTORE
@@ -318,6 +361,7 @@ iverilog -g2001 -DSIMULATION \
     -o sim/tb_randomx_top.vvp \
     rtl/aes_round.v rtl/aes_gen1r.v rtl/aes_gen4r.v rtl/aes_hash1r.v \
     rtl/blake2b_core.v rtl/scratchpad_mem.v rtl/hbm_dataset_if.v \
+    rtl/cache_hbm_if.v rtl/axi_arbiter.v \
     rtl/alu_int.v rtl/fpu_double.v rtl/superscalar_hash.v \
     rtl/argon2_fill.v rtl/randomx_vm.v rtl/randomx_top.v \
     sim/tb_randomx_top.v
@@ -332,6 +376,11 @@ vvp sim/tb_blake2b.vvp   # 输出 ALL TESTS PASSED
 iverilog -g2001 -o sim/tb_hbm_dataset_if.vvp \
     rtl/hbm_dataset_if.v sim/tb_hbm_dataset_if.v
 vvp sim/tb_hbm_dataset_if.vvp   # 输出 PASS
+
+# Cache 存储接口单元测试（AXI4 从设备模型 + 随机背压 + SLVERR 注入）
+iverilog -g2001 -DSIMULATION -o sim/tb_cache_hbm_if.vvp \
+    rtl/cache_hbm_if.v sim/tb_cache_hbm_if.v
+vvp sim/tb_cache_hbm_if.vvp   # 输出 ALL TESTS PASSED
 
 # Argon2d Cache 填充单元测试（与 Argon2 参考实现黄金向量比对）
 iverilog -g2001 -DSIMULATION -o sim/tb_argon2_fill.vvp \
@@ -365,7 +414,9 @@ done
 - 使用 `-DSIMULATION` 宏时：
   - Scratchpad 从 2 MiB 缩减为 32 KiB
   - Argon2d 从 262144 块缩减为 8 块（1 轮）
-- HBM 接口在仿真中为 stub（`arready=0`），VM 的 Dataset 访问会等待
+- `sim/tb_randomx_top.v` 内含行为级 HBM AXI4 从设备模型：Cache 窗口
+  （`0x0_C000_0000` 起 8 KiB）由内存支持，因此 CACHE_INIT 阶段会真正把
+  Argon2d 块写进 HBM 模型；窗口外（尚未生成的 Dataset）读回全 0
 
 ---
 
@@ -377,10 +428,11 @@ done
 |----------------------------|---------------------------------------------------------|------|
 | `sim/tb_blake2b.v`         | `"abc"`（外部 IV / `init` 两种）、空消息、200 字节两块链式哈希、`busy` 握手 | PASS（`ALL TESTS PASSED`）|
 | `sim/tb_hbm_dataset_if.v`  | 行为级 AXI4 从设备模型：多事务流水、背压、错误注入、AXI 属性与基址检查 | PASS |
+| `sim/tb_cache_hbm_if.v`    | 1 KiB 块 ↔ AXI4 突发：写/读回环、HBM 内字节序、随机背压、握手复用、SLVERR 粘滞位 | PASS（`ALL TESTS PASSED`）|
 | `sim/tb_superscalar_hash.v`| 全部 14 种 SuperscalarHash 指令，与软件模型逐寄存器比对   | PASS（269 周期）|
 | `sim/tb_fpu_double.v`      | FADD/FSUB/FMUL/FDIV/FSQRT/FSCAL/FSWAP，含 4 种舍入模式、NaN/Inf/±0、非规格化、上溢/下溢与 `busy` 握手 | PASS（47 项检查）|
 | `sim/tb_argon2_fill.v`     | Argon2d Cache 填充：与 Argon2 参考实现黄金向量逐块比对（m=8/t=3/43 字节 key，m=32/t=1/64 字节 key） | PASS |
-| `sim/tb_randomx_top.v`     | 顶层集成冒烟测试：寄存器写种子 → start → 轮询 done → 读回哈希；HBM 为 stub | 运行完成（非自校验）|
+| `sim/tb_randomx_top.v`     | 顶层集成冒烟测试：寄存器写种子 → start → 轮询 done → 读回哈希；含行为级 HBM 模型，检查 Cache 块确实写入 HBM | 运行完成（哈希值尚未自校验）|
 
 > `make test` 会逐个运行上述 testbench，并在输出中出现 `FAIL` / `ERROR` 时返回非 0 退出码。
 
@@ -404,18 +456,22 @@ done
 | aes_hash1r.v     | 骨架       | 从种子派生正确轮密钥                         |
 | scratchpad_mem.v | **已实现** | 无（URAM 推断、L1/L2/L3 掩码）             |
 | hbm_dataset_if.v | **已实现** | 连接 Vivado HBM IP、写接口接到 superscalar_hash |
+| cache_hbm_if.v   | **已实现** | 连接 Vivado HBM IP（与 dataset 共用端口）    |
+| axi_arbiter.v    | **已实现** | 无（读/写通路独立 round-robin 仲裁）         |
 | alu_int.v        | 基本实现   | IMUL_RCP（可复用 superscalar_hash 的倒数单元）|
 | fpu_double.v     | **已实现** | 流水化以提升 Fmax（当前加/乘为单周期组合路径）|
 | superscalar_hash.v| **已实现** | 超标量调度（并行执行端口，性能优化）        |
 | randomx_vm.v     | 骨架       | 完整指令译码、内存地址计算、CFROUND         |
-| argon2_fill.v    | **已实现** | 接到真实 cache 存储（HBM/URAM） |
+| argon2_fill.v    | **已实现** | 无（cache 块经 cache_hbm_if 存入 HBM）      |
 
 ---
 
 ## 完善路线图（优先级从高到低）
 
-1. **Cache 存储** — 将 `argon2_fill.v` 的 1 KiB 块读写端口接到真实的
-   cache 存储（HBM 或大容量 URAM），目前 `randomx_top.v` 中仍为占位连接。
+1. ~~**Cache 存储** — 将 `argon2_fill.v` 的 1 KiB 块读写端口接到真实的
+   cache 存储（HBM 或大容量 URAM）。~~ **已完成**：新增 `cache_hbm_if.v`
+   （1 KiB 块 ↔ 32 拍 AXI4 突发）与 `axi_arbiter.v`（cache/dataset 共享
+   HBM 端口），`randomx_top.v` 中的占位连接已去除。
 2. **`randomx_vm.v`** — 29 条 ISA 完整译码、CFROUND、L1/L2/L3 地址掩码、
    浮点寄存器前递、Dataset 取数与 MX/MA 更新、程序结束的 Scratchpad XOR + AesHash1R。
 3. **`randomx_top.v`** — 打通 DS_GEN（SuperscalarHash 8 pass）与 FINAL_HASH，
