@@ -48,7 +48,7 @@ reg         reg_rd_en;
 reg  [7:0]  reg_rd_addr;
 wire [31:0] reg_rd_data;
 
-// AXI HBM stubs (tie off — dataset not populated in simulation)
+// AXI HBM master port (driven by the behavioural HBM slave model below)
 wire [33:0] m_axi_araddr;
 wire [7:0]  m_axi_arlen;
 wire [2:0]  m_axi_arsize;
@@ -66,6 +66,16 @@ wire        m_axi_wlast;
 wire        m_axi_wvalid;
 wire        m_axi_bready;
 
+reg          m_axi_arready;
+reg  [255:0] m_axi_rdata;
+reg  [1:0]   m_axi_rresp;
+reg          m_axi_rlast;
+reg          m_axi_rvalid;
+reg          m_axi_awready;
+reg          m_axi_wready;
+reg  [1:0]   m_axi_bresp;
+reg          m_axi_bvalid;
+
 // ---------------------------------------------------------------------------
 // DUT instantiation
 // ---------------------------------------------------------------------------
@@ -78,33 +88,147 @@ randomx_top u_dut (
     .reg_rd_en     (reg_rd_en),
     .reg_rd_addr   (reg_rd_addr),
     .reg_rd_data   (reg_rd_data),
-    // HBM — stub (arready=0, rvalid=0: DUT will stall on dataset accesses)
+    // HBM — behavioural AXI4 slave model (cache region backed by memory,
+    // dataset region returns zeros)
     .m_axi_araddr  (m_axi_araddr),
     .m_axi_arlen   (m_axi_arlen),
     .m_axi_arsize  (m_axi_arsize),
     .m_axi_arburst (m_axi_arburst),
     .m_axi_arvalid (m_axi_arvalid),
-    .m_axi_arready (1'b0),
-    .m_axi_rdata   (256'b0),
-    .m_axi_rresp   (2'b0),
-    .m_axi_rlast   (1'b0),
-    .m_axi_rvalid  (1'b0),
+    .m_axi_arready (m_axi_arready),
+    .m_axi_rdata   (m_axi_rdata),
+    .m_axi_rresp   (m_axi_rresp),
+    .m_axi_rlast   (m_axi_rlast),
+    .m_axi_rvalid  (m_axi_rvalid),
     .m_axi_rready  (m_axi_rready),
     .m_axi_awaddr  (m_axi_awaddr),
     .m_axi_awlen   (m_axi_awlen),
     .m_axi_awsize  (m_axi_awsize),
     .m_axi_awburst (m_axi_awburst),
     .m_axi_awvalid (m_axi_awvalid),
-    .m_axi_awready (1'b0),
+    .m_axi_awready (m_axi_awready),
     .m_axi_wdata   (m_axi_wdata),
     .m_axi_wstrb   (m_axi_wstrb),
     .m_axi_wlast   (m_axi_wlast),
     .m_axi_wvalid  (m_axi_wvalid),
-    .m_axi_wready  (1'b0),
-    .m_axi_bresp   (2'b0),
-    .m_axi_bvalid  (1'b0),
+    .m_axi_wready  (m_axi_wready),
+    .m_axi_bresp   (m_axi_bresp),
+    .m_axi_bvalid  (m_axi_bvalid),
     .m_axi_bready  (m_axi_bready)
 );
+
+
+// ---------------------------------------------------------------------------
+// Behavioural HBM AXI4 slave model
+//
+// Only the Argon2d cache window (CACHE_BASE .. CACHE_BASE + CACHE_BYTES) is
+// backed by memory — that is all the simulation build needs, because
+// `iverilog -DSIMULATION` reduces the Argon2 memory cost to 8 blocks (8 KiB).
+// Accesses outside the window read back zeros and drop write data, which
+// matches the previous behaviour for the (not yet generated) dataset.
+// ---------------------------------------------------------------------------
+localparam [33:0] CACHE_BASE  = 34'h0_C000_0000;
+localparam        CACHE_WORDS = 256;              // 256 × 32 B = 8 KiB
+
+reg [255:0] hbm_mem [0:CACHE_WORDS-1];
+
+reg [33:0] slv_wr_addr;
+reg [8:0]  slv_wr_left;
+reg        slv_wr_active;
+reg [33:0] slv_rd_addr;
+reg [8:0]  slv_rd_left;
+reg        slv_rd_active;
+
+function integer cache_word;
+    input [33:0] byte_addr;
+    cache_word = (byte_addr - CACHE_BASE) >> 5;
+endfunction
+
+function in_cache;
+    input [33:0] byte_addr;
+    in_cache = (byte_addr >= CACHE_BASE) &&
+               ((byte_addr - CACHE_BASE) < (CACHE_WORDS * 32));
+endfunction
+
+integer w;
+
+always @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+        m_axi_arready <= 1'b0;
+        m_axi_awready <= 1'b0;
+        m_axi_wready  <= 1'b0;
+        m_axi_rvalid  <= 1'b0;
+        m_axi_rlast   <= 1'b0;
+        m_axi_rresp   <= 2'b00;
+        m_axi_rdata   <= 256'b0;
+        m_axi_bvalid  <= 1'b0;
+        m_axi_bresp   <= 2'b00;
+        slv_wr_active <= 1'b0;
+        slv_rd_active <= 1'b0;
+        slv_wr_left   <= 9'd0;
+        slv_rd_left   <= 9'd0;
+        slv_wr_addr   <= 34'b0;
+        slv_rd_addr   <= 34'b0;
+    end else begin
+        // ---- Write address ----
+        if (m_axi_awvalid && m_axi_awready) begin
+            slv_wr_active <= 1'b1;
+            slv_wr_addr   <= m_axi_awaddr;
+            slv_wr_left   <= {1'b0, m_axi_awlen} + 9'd1;
+            m_axi_awready <= 1'b0;
+        end else begin
+            m_axi_awready <= !slv_wr_active && !m_axi_awready;
+        end
+
+        // ---- Write data ----
+        m_axi_wready <= slv_wr_active;
+        if (m_axi_wvalid && m_axi_wready) begin
+            if (in_cache(slv_wr_addr))
+                hbm_mem[cache_word(slv_wr_addr)] <= m_axi_wdata;
+            slv_wr_addr <= slv_wr_addr + 34'd32;
+            slv_wr_left <= slv_wr_left - 9'd1;
+            if (m_axi_wlast) begin
+                slv_wr_active <= 1'b0;
+                m_axi_wready  <= 1'b0;
+                m_axi_bvalid  <= 1'b1;
+                m_axi_bresp   <= 2'b00;
+            end
+        end
+
+        if (m_axi_bvalid && m_axi_bready)
+            m_axi_bvalid <= 1'b0;
+
+        // ---- Read address ----
+        if (m_axi_arvalid && m_axi_arready) begin
+            slv_rd_active <= 1'b1;
+            slv_rd_addr   <= m_axi_araddr;
+            slv_rd_left   <= {1'b0, m_axi_arlen} + 9'd1;
+            m_axi_arready <= 1'b0;
+        end else begin
+            m_axi_arready <= !slv_rd_active && !m_axi_arready;
+        end
+
+        // ---- Read data ----
+        if (slv_rd_active && (!m_axi_rvalid || m_axi_rready)) begin
+            m_axi_rvalid <= 1'b1;
+            m_axi_rdata  <= in_cache(slv_rd_addr) ?
+                            hbm_mem[cache_word(slv_rd_addr)] : 256'b0;
+            m_axi_rresp  <= 2'b00;
+            m_axi_rlast  <= (slv_rd_left == 9'd1);
+            slv_rd_addr  <= slv_rd_addr + 34'd32;
+            slv_rd_left  <= slv_rd_left - 9'd1;
+            if (slv_rd_left == 9'd1)
+                slv_rd_active <= 1'b0;
+        end else if (m_axi_rvalid && m_axi_rready) begin
+            m_axi_rvalid <= 1'b0;
+            m_axi_rlast  <= 1'b0;
+        end
+    end
+end
+
+initial begin
+    for (w = 0; w < CACHE_WORDS; w = w + 1) hbm_mem[w] = 256'b0;
+end
 
 // ---------------------------------------------------------------------------
 // Waveform dump
@@ -151,6 +275,7 @@ endtask
 // Test sequence
 // ---------------------------------------------------------------------------
 integer timeout;
+integer nonzero;
 reg [31:0] status;
 reg [31:0] hash_word;
 
@@ -211,6 +336,17 @@ initial begin
         $display("[TB] Done asserted after ~%0d poll cycles at time %0t ns",
                  timeout, $time);
     end
+
+    // --- Check that the Argon2d cache fill actually reached HBM ----------
+    // SIMULATION build: 8 blocks × 1 KiB = 256 words of 32 bytes.
+    nonzero = 0;
+    for (w = 0; w < CACHE_WORDS; w = w + 1)
+        if (hbm_mem[w] !== 256'b0) nonzero = nonzero + 1;
+    if (nonzero == 0)
+        $display("[TB] FAIL: cache region in HBM is still empty (Argon2d cache storage not connected)");
+    else
+        $display("[TB] Cache fill wrote %0d/%0d non-zero 32-byte words to HBM",
+                 nonzero, CACHE_WORDS);
 
     // --- Read back hash output ---
     $display("[TB] Hash output:");
