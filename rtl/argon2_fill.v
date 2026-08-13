@@ -440,13 +440,15 @@ always @(posedge clk or negedge rst_n) begin
 
             ST_H0_NEXT: begin
                 // h0_blk has advanced: issue the next 128-byte message block
-                b2b_msg      <= h0_blk_msg;
-                b2b_byte_cnt <= {96'b0, h0_cnt_nxt};
-                b2b_h_in     <= b2b_h_out;
-                b2b_init     <= 1'b0;
-                b2b_last     <= h0_is_last;
-                b2b_start    <= 1'b1;
-                state        <= ST_H0;
+                if (!b2b_busy) begin
+                    b2b_msg      <= h0_blk_msg;
+                    b2b_byte_cnt <= {96'b0, h0_cnt_nxt};
+                    b2b_h_in     <= b2b_h_out;
+                    b2b_init     <= 1'b0;
+                    b2b_last     <= h0_is_last;
+                    b2b_start    <= 1'b1;
+                    state        <= ST_H0;
+                end
             end
 
             ST_HP_FIRST: begin
