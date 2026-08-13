@@ -189,13 +189,12 @@ function [63:0] rotr64;
 endfunction
 
 function [255:0] gb;
-    input [63:0] a_in;
-    input [63:0] b_in;
-    input [63:0] c_in;
-    input [63:0] d_in;
-    reg [63:0] a, b, c, d, mul;
+    input [63:0] a;
+    input [63:0] b;
+    input [63:0] c;
+    input [63:0] d;
+    reg [63:0] mul;
     begin
-        a = a_in; b = b_in; c = c_in; d = d_in;
         mul = a[31:0] * b[31:0];
         a   = a + b + {mul[62:0], 1'b0};
         d   = rotr64(d ^ a, 7'd32);          // rotr64(d ^ a, 32)
