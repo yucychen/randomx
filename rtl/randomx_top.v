@@ -6,7 +6,8 @@
 // Tool:   Vivado 2022.x or later
 //
 // Interface: AXI-Lite style control/status registers (simplified, not full AXI)
-//   Write 0x00 ← seed[511:0] (8 × 32-bit writes)
+//   Write 0x00 ← seed[511:0] (16 × 32-bit writes)
+//   Write 0x88 ← Argon2 key length in bytes (1..64, defaults to 64)
 //   Write 0x20 ← control[0] = start
 //   Read  0x24 → status[0] = done
 //   Read  0x28..0x47 → hash_out[511:0] (8 × 32-bit reads)
@@ -71,6 +72,8 @@ module randomx_top (
 
 // Seed register (512 bits = 64 bytes, written via 16 × 32-bit register writes)
 reg [511:0] seed_reg;
+// Argon2 key length in bytes (RandomX uses the full seed by default)
+reg [15:0]  key_len_reg;
 
 // Control / status
 reg         start_pulse;
@@ -167,12 +170,21 @@ blake2b_core u_blake2b (
 );
 
 // --- Argon2d cache fill ---
-argon2_fill u_argon2 (
+argon2_fill #(
+`ifdef SIMULATION
+    // Simulation build: reduce the Argon2 memory cost to 8 blocks (8 KiB)
+    .ARGON_M (8),
+`else
+    .ARGON_M (262144),
+`endif
+    .ARGON_T (3),
+    .KEY_BYTES (64)
+) u_argon2 (
     .clk            (clk),
     .rst_n          (rst_n),
     .start          (argon2_start),
     .key            (seed_reg),
-    .key_len        (7'd64),    // seed is a full 64-byte key
+    .key_len        (key_len_reg),
     .cache_wr_en    (argon2_cache_wr_en),
     .cache_wr_addr  (argon2_cache_wr_addr),
     .cache_wr_data  (argon2_cache_wr_data),
@@ -494,6 +506,7 @@ randomx_vm u_vm (
 always @(posedge clk or negedge rst_n) begin
     if (!rst_n) begin
         seed_reg    <= 512'b0;
+        key_len_reg <= 16'd64;
         start_pulse <= 1'b0;
     end else begin
         start_pulse <= 1'b0;
@@ -518,6 +531,9 @@ always @(posedge clk or negedge rst_n) begin
                 8'h3C: seed_reg[511:480] <= reg_wr_data;
                 // Control register: 0x40
                 8'h40: start_pulse <= reg_wr_data[0];
+                // Argon2 key length in bytes: 0x88 (1..64)
+                8'h88: key_len_reg <= (reg_wr_data[15:0] > 16'd64) ? 16'd64
+                                                                   : reg_wr_data[15:0];
                 default: ; // ignore unknown addresses
             endcase
         end

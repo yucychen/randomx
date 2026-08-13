@@ -137,6 +137,7 @@ randomx/
   | 0x40    | 写   | 控制寄存器（bit0=start）      |
   | 0x44    | 读   | 状态寄存器（bit0=done/~busy，bit1=HBM AXI 错误粘滞位） |
   | 0x48~0x84 | 读 | 哈希输出（512位，16×32位）   |
+  | 0x88    | 写   | Argon2 key 字节数（1~64，复位默认 64） |
 - **主 FSM**：IDLE → CACHE_INIT → VM_RUN → FINAL_HASH → DONE
 - **HBM 地址映射**（34 位字节地址，8 GB HBM 堆栈）：
 
@@ -265,11 +266,18 @@ randomx/
      再对 8 个列做 P 置换，`B[i] = Z ^ R`；t>1 时为 XOR 模式 `B[i] ^= Z ^ R`
   5. P 为 Argon2 BlaMka 置换（带 64 位乘加的 Blake2b 轮函数），
      每半轮 4 个 G_B 并行，一个块共 16 轮 × 2 = 32 周期
-- 状态机：IDLE → H0 → HP_FIRST → HP_NEXT → HP_WRITE →
+- 状态机：IDLE → H0（长 key 时经 H0_NEXT 多块链式）→ HP_FIRST → HP_NEXT → HP_WRITE →
   RD_PREV → RD_REF →（t>1 时 RD_CUR）→ ROUNDS → WRITE → DONE
 - 接口：共享 Blake2b 核（`b2b_*`）+ 1 KiB 位宽的 cache 读写端口
   （按块索引寻址，面向外部 URAM/HBM 存储）
-- 成本参数 `ARGON_M` / `ARGON_T` 可通过 parameter 覆盖（仿真时默认缩减为 8 块）
+- 成本参数与源码一致且可被 parameter 覆盖：`ARGON_M` 默认 262144（仿真缩减
+  由 `randomx_top.v` 实例化时覆盖，模块默认值不再随 `-DSIMULATION` 改变），
+  `ARGON_T` 支持任意轮数（不再限制为 ≤4），`ARGON_M` 按参考实现规整
+  （小于 `2×SYNC_POINTS×lanes` 时抬高，并向下取整到段长的整数倍；H0 仍哈希
+  用户请求的 m_cost）
+- key 长度可变：`KEY_BYTES` 决定端口宽度（默认 64 字节），H0 按 128 字节分块
+  链式哈希，因此超过 80 字节的 key 也与参考实现一致；顶层由寄存器 0x88 指定
+  实际字节数
 - 单元测试：`sim/tb_argon2_fill.v`，与 Argon2 参考实现生成的黄金向量逐块比对
 - **TODO**：接到真实 cache 存储（`randomx_top.v` 中的 cache 端口目前仍为占位）
 
@@ -413,7 +421,7 @@ done
 ### 仿真说明
 - 使用 `-DSIMULATION` 宏时：
   - Scratchpad 从 2 MiB 缩减为 32 KiB
-  - Argon2d 从 262144 块缩减为 8 块（1 轮）
+  - Argon2d 从 262144 块缩减为 8 块（`randomx_top.v` 中的 parameter 覆盖）
 - `sim/tb_randomx_top.v` 内含行为级 HBM AXI4 从设备模型：Cache 窗口
   （`0x0_C000_0000` 起 8 KiB）由内存支持，因此 CACHE_INIT 阶段会真正把
   Argon2d 块写进 HBM 模型；窗口外（尚未生成的 Dataset）读回全 0
@@ -431,7 +439,7 @@ done
 | `sim/tb_cache_hbm_if.v`    | 1 KiB 块 ↔ AXI4 突发：写/读回环、HBM 内字节序、随机背压、握手复用、SLVERR 粘滞位 | PASS（`ALL TESTS PASSED`）|
 | `sim/tb_superscalar_hash.v`| 全部 14 种 SuperscalarHash 指令，与软件模型逐寄存器比对   | PASS（269 周期）|
 | `sim/tb_fpu_double.v`      | FADD/FSUB/FMUL/FDIV/FSQRT/FSCAL/FSWAP，含 4 种舍入模式、NaN/Inf/±0、非规格化、上溢/下溢与 `busy` 握手 | PASS（47 项检查）|
-| `sim/tb_argon2_fill.v`     | Argon2d Cache 填充：与 Argon2 参考实现黄金向量逐块比对（m=8/t=3/43 字节 key，m=32/t=1/64 字节 key） | PASS |
+| `sim/tb_argon2_fill.v`     | Argon2d Cache 填充：与 Argon2 参考实现黄金向量逐块比对（m=8/t=3/43 字节 key，m=32/t=1/64 字节 key，m=6→8/t=5/100 字节 key） | PASS |
 | `sim/tb_randomx_top.v`     | 顶层集成冒烟测试：寄存器写种子 → start → 轮询 done → 读回哈希；含行为级 HBM 模型，检查 Cache 块确实写入 HBM | 运行完成（哈希值尚未自校验）|
 
 > `make test` 会逐个运行上述 testbench，并在输出中出现 `FAIL` / `ERROR` 时返回非 0 退出码。
