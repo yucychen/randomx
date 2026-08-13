@@ -99,27 +99,19 @@ module argon2_fill #(
 // ---------------------------------------------------------------------------
 // Argon2d configuration constants (RandomX defaults)
 // ---------------------------------------------------------------------------
-localparam ARGON_P       = 1;       // parallelism (lanes)
-localparam ARGON_LANES   = ARGON_P;
-localparam ARGON_SEGS    = 4;       // segments (slices) per pass per lane
-localparam ARGON_VERSION = 32'h13;  // Argon2 version 1.3
-localparam ARGON_TYPE    = 32'd0;   // 0 = Argon2d
-localparam ARGON_TAGLEN  = 32'd0;   // RandomX requests no final tag
+localparam [31:0] ARGON_LANES   = 32'd1;    // parallelism (lanes)
+localparam [31:0] ARGON_SEGS    = 32'd4;    // slices per pass per lane
+localparam [31:0] ARGON_VERSION = 32'h13;   // Argon2 version 1.3
+localparam [31:0] ARGON_TYPE    = 32'd0;    // 0 = Argon2d
+localparam [31:0] ARGON_TAGLEN  = 32'd0;    // RandomX requests no final tag
 // Memory cost normalisation, exactly as in the Argon2 reference implementation:
 // m is raised to 2 * ARGON2_SYNC_POINTS * lanes and then truncated to a
 // multiple of the segment count. H0 still hashes the *requested* m_cost.
-localparam ARGON_M_MIN   = 2 * ARGON_SEGS * ARGON_LANES;
-localparam ARGON_M_RAISED= (ARGON_M < ARGON_M_MIN) ? ARGON_M_MIN : ARGON_M;
-localparam SEG_LEN       = ARGON_M_RAISED / (ARGON_LANES * ARGON_SEGS);
-localparam ARGON_BLOCKS  = SEG_LEN * ARGON_LANES * ARGON_SEGS;
-localparam LANE_LEN      = ARGON_BLOCKS / ARGON_LANES;
-
-// Sized copies of the configuration used inside expressions
-localparam [31:0] ARGON_LANES32 = ARGON_LANES;
-localparam [31:0] ARGON_M32     = ARGON_M;
-localparam [31:0] ARGON_T32     = ARGON_T;
-localparam [31:0] LANE_LEN32    = LANE_LEN;
-localparam [31:0] SEG_LEN32     = SEG_LEN;
+localparam [31:0] ARGON_M_MIN   = 32'd2 * ARGON_SEGS * ARGON_LANES;
+localparam [31:0] ARGON_M_RAISED= (ARGON_M < ARGON_M_MIN) ? ARGON_M_MIN : ARGON_M;
+localparam [31:0] SEG_LEN       = ARGON_M_RAISED / (ARGON_LANES * ARGON_SEGS);
+localparam [31:0] ARGON_BLOCKS  = SEG_LEN * ARGON_LANES * ARGON_SEGS;
+localparam [31:0] LANE_LEN      = ARGON_BLOCKS / ARGON_LANES;
 localparam [31:0] LAST_PASS     = ARGON_T - 1;
 
 // RANDOMX_ARGON_SALT = "RandomX\x03" (8 bytes, little-endian packed)
@@ -127,8 +119,7 @@ localparam [63:0] ARGON_SALT    = 64'h03586d6f646e6152;
 localparam [31:0] ARGON_SALTLEN = 32'd8;
 
 localparam BLOCK_BITS = 8192;       // 1 KiB block
-localparam HP_CHUNKS  = 30;         // 30 × 32-byte chunks + one 64-byte tail
-localparam [4:0] HP_LAST = HP_CHUNKS;
+localparam [4:0] HP_CHUNKS = 5'd30;  // 30 × 32-byte chunks + one 64-byte tail
 
 // H0 pre-hash message layout: 7 × LE32 parameters, the key, then
 // LE32(|S|) || S || LE32(|K|) || LE32(|X|). Longer keys simply need more
@@ -303,19 +294,19 @@ wire [31:0] rel_x  = j1_sq[63:32];
 // reference area size (blocks that may be referenced)
 wire [31:0] ref_area = (pass_cnt == 32'd0)
                      ? (block_idx - 32'd1)
-                     : (LANE_LEN32 - SEG_LEN32 + seg_idx - 32'd1);
+                     : (LANE_LEN - SEG_LEN + seg_idx - 32'd1);
 wire [63:0] ref_mul  = ref_area * rel_x;
 wire [31:0] rel_pos  = ref_area - 32'd1 - ref_mul[63:32];
 // first block of the reference area
 wire [31:0] start_pos = (pass_cnt == 32'd0 || seg_cnt == 2'd3)
                       ? 32'd0
-                      : (({30'b0, seg_cnt} + 32'd1) * SEG_LEN32);
+                      : (({30'b0, seg_cnt} + 32'd1) * SEG_LEN);
 wire [31:0] abs_pos   = start_pos + rel_pos;
-wire [31:0] ref_next  = (abs_pos >= LANE_LEN32) ? (abs_pos - LANE_LEN32)
-                                                    : abs_pos;
+wire [31:0] ref_next  = (abs_pos >= LANE_LEN) ? (abs_pos - LANE_LEN)
+                                              : abs_pos;
 
 // Previous block index, wrapping to the last block of the lane at i == 0
-wire [31:0] prev_idx = (block_idx == 32'd0) ? (LANE_LEN32 - 32'd1)
+wire [31:0] prev_idx = (block_idx == 32'd0) ? (LANE_LEN - 32'd1)
                                             : (block_idx - 32'd1);
 
 // ---------------------------------------------------------------------------
@@ -335,10 +326,10 @@ end
 
 always @* begin
     h0_msg = {H0_MSG_BITS{1'b0}};
-    h0_msg[  0 +: 32] = ARGON_LANES32;
+    h0_msg[  0 +: 32] = ARGON_LANES;
     h0_msg[ 32 +: 32] = ARGON_TAGLEN;
-    h0_msg[ 64 +: 32] = ARGON_M32;
-    h0_msg[ 96 +: 32] = ARGON_T32;
+    h0_msg[ 64 +: 32] = ARGON_M;
+    h0_msg[ 96 +: 32] = ARGON_T;
     h0_msg[128 +: 32] = ARGON_VERSION;
     h0_msg[160 +: 32] = ARGON_TYPE;
     h0_msg[192 +: 32] = {16'b0, key_len};
@@ -474,8 +465,8 @@ always @(posedge clk or negedge rst_n) begin
             ST_HP_NEXT: begin
                 // V2..V31: 32 bytes of each of V2..V30, then all 64 bytes of V31
                 if (b2b_done) begin
-                    if (hp_cnt == HP_LAST) begin
-                        work[HP_CHUNKS*256 +: 512] <= b2b_h_out;
+                    if (hp_cnt == HP_CHUNKS) begin
+                        work[{8'b0, HP_CHUNKS} * 13'd256 +: 512] <= b2b_h_out;
                         state <= ST_HP_WRITE;
                     end else begin
                         work[{hp_cnt, 8'b0} +: 256] <= b2b_h_out[255:0];
@@ -559,7 +550,7 @@ always @(posedge clk or negedge rst_n) begin
                 cache_wr_data <= work ^ xacc;
                 if (cache_wr_rdy && cache_wr_en) begin
                     cache_wr_en <= 1'b0;
-                    if (block_idx == LANE_LEN32 - 32'd1) begin
+                    if (block_idx == LANE_LEN - 32'd1) begin
                         // End of a pass
                         block_idx <= 32'd0;
                         seg_cnt   <= 2'd0;
@@ -569,7 +560,7 @@ always @(posedge clk or negedge rst_n) begin
                                                                        : ST_RD_PREV;
                     end else begin
                         block_idx <= block_idx + 32'd1;
-                        if (seg_idx == SEG_LEN32 - 32'd1) begin
+                        if (seg_idx == SEG_LEN - 32'd1) begin
                             seg_idx <= 32'd0;
                             seg_cnt <= seg_cnt + 2'd1;
                         end else begin
