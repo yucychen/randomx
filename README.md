@@ -31,9 +31,11 @@ randomx/
 │   ├── hbm_dataset_if.v    # HBM2 AXI4 主设备接口（数据集读写，流水化）
 │   ├── cache_hbm_if.v      # Argon2d Cache 存储接口（1 KiB 块 ↔ AXI4 突发）
 │   ├── axi_arbiter.v       # 2 主设备 AXI4 仲裁器（cache + dataset 共享 HBM 端口）
-│   └── argon2_fill.v       # Argon2d Cache 填充（基于 Blake2b，已实现）
+│   ├── argon2_fill.v       # Argon2d Cache 填充（基于 Blake2b，已实现）
+│   └── randomx_hbm_top.v   # 板级顶层（复位门控 + 地址位宽适配 + HBM IP 例化）
 ├── sim/
 │   ├── tb_randomx_top.v    # 基础功能仿真 testbench
+│   ├── tb_randomx_hbm_top.v# 板级顶层 testbench（复位门控/地址适配自校验）
 │   ├── tb_blake2b.v        # Blake2b-512 参考测试向量 testbench（含多块/busy）
 │   ├── tb_hbm_dataset_if.v # HBM AXI4 接口 testbench（含 AXI 从设备模型）
 │   ├── tb_cache_hbm_if.v   # Cache 存储接口 testbench（含 AXI 从设备模型）
@@ -41,8 +43,8 @@ randomx/
 │   ├── tb_fpu_double.v     # 双精度浮点单元 testbench
 │   └── tb_superscalar_hash.v # SuperscalarHash 全指令集 testbench
 ├── vivado/
-│   ├── build.tcl           # Vivado TCL 构建脚本（非项目模式）
-│   └── constraints.xdc     # 时序约束（300 MHz 时钟 + HBM 占位符）
+│   ├── build.tcl           # Vivado TCL 构建脚本（含 HBM IP / 协议转换器创建）
+│   └── constraints.xdc     # 时序约束（300 MHz + HBM 时钟 + SLR pblock）
 ├── .github/workflows/ci.yml# CI：语法检查 + 全部 testbench + Verilator lint
 ├── Makefile                # 编译 / 仿真 / lint 自动化
 └── README.md               # 本文档
@@ -302,30 +304,97 @@ randomx/
 - Xilinx Vivado 2022.1 或更高版本（含 XCVU33P 支持）
 - HBM IP 许可（用于实现阶段；综合无需）
 
-### 步骤
+### 两种构建方式
+
+`vivado/build.tcl` 有一个 `hbm_enable` 开关，决定顶层与是否创建 HBM IP：
+
+| 构建 | 命令 | 顶层 | HBM IP | 用途 |
+|------|------|------|--------|------|
+| 厂商无关 | `vivado -mode batch -source vivado/build.tcl` | `randomx_top` | 否 | 快速综合/资源评估，无需许可 |
+| 板级 | `vivado -mode batch -source vivado/build.tcl -tclargs hbm` | `randomx_hbm_top` | 是 | 上板，实现阶段需 HBM 许可 |
 
 **1. 启动综合**
 ```bash
-# 批处理模式
-vivado -mode batch -source vivado/build.tcl
-
-# 或在 Vivado GUI 中打开 Tcl 控制台执行：
-source vivado/build.tcl
+vivado -mode batch -source vivado/build.tcl            # 厂商无关
+vivado -mode batch -source vivado/build.tcl -tclargs hbm  # 板级（含 HBM IP）
 ```
 
 **2. 查看综合结果**
 ```tcl
-# 在 Vivado Tcl 控制台中：
 open_run synth_1 -name synth_1
 report_utilization -file utilization.rpt
 report_timing_summary -file timing.rpt
+# 定位组合逻辑过深的路径：300 MHz 下逻辑级数 > ~8 基本无法收敛
+report_design_analysis -logic_level_distribution
 ```
 
-**3. 完整实现（需 HBM IP 配置）**
+**3. 完整实现（需 HBM IP 许可）**
 ```tcl
 launch_runs impl_1 -jobs 8
 wait_on_run impl_1
 ```
+
+### HBM IP 配置要点
+
+`build.tcl` 在 `-tclargs hbm` 时创建两个 IP：
+
+| IP | 关键配置 | 理由 |
+|----|---------|------|
+| `hbm_0` | `USER_HBM_DENSITY 4GB`、`USER_HBM_STACK 1` | XCVU33P 单个 4 GB HBM2 堆栈 |
+| | `USER_SAXI_00 true` | 第一版只启用 1 个 AXI 端口，对应唯一的 `m_axi_*` |
+| | **`USER_SWITCH_ENABLE_00 true`** | **必须**：见下方地址映射说明 |
+| | `USER_AXI_CLK_FREQ 300` | 与核心同频，省掉 CDC |
+| | `USER_HBM_REF_CLK_0 100` / `USER_APB_PCLK_0 100` | 参考时钟与 APB 配置时钟 |
+| `axi_protocol_converter_0` | `SI_PROTOCOL AXI4` → `MI_PROTOCOL AXI3` | `cache_hbm_if` 发 32 拍突发，HBM 从端口是 AXI3 风格（`awlen` 4 位，最多 16 拍），需拆分 |
+
+> **为什么必须开 Global Addressing**：单个 HBM 伪通道只映射 256 MB，而本设计
+> 的 Dataset 在 `0x0_0000_0000`（~2.08 GiB）、Cache 在 `0x0_C000_0000`（256 MiB）。
+> 不开内部 AXI Switch 时，`0xC000_0000` 的 Cache 访问会返回 DECERR，
+> 表现为状态寄存器 `0x44` 的 bit1（AXI 错误粘滞位）置起。
+
+### `randomx_hbm_top.v` — 板级顶层
+
+`randomx_top.v` 保持厂商无关（不例化任何 IP），HBM 相关的适配全部放在这一层：
+
+1. **复位门控**：HBM 控制器通过 `apb_complete` 报告就绪，
+   `sys_rst_n & hbm_init_done` 经同步器后作为核心复位。
+   HBM 未就绪就发起 AXI 事务是"综合通过但上板读回全 0"的最常见原因。
+2. **地址位宽适配**：核心输出 34 位，4 GB HBM 的 AXI 从端口是 33 位。
+   被裁掉的高位在本设计中恒为 0，该假设由硬件检查——一旦某个地址的高位非 0，
+   粘滞标志 `hbm_addr_err` 置起并可被主机读回。
+3. **可选 IP 例化**：由 `HBM_IP` 宏控制。未定义时（仿真 / lint / `make syntax`）
+   AXI 端口暴露在边界上，可继续复用现有的行为级 HBM 模型；
+   定义时（`build.tcl` 自动设置）转而驱动 `hbm_0` 与 `axi_protocol_converter_0`。
+
+### 约束说明（`vivado/constraints.xdc`）
+
+- 同一份 XDC 同时适配两种顶层：通过 `get_ports -quiet` 判断端口是否存在，
+  自动匹配 `clk`/`sys_clk`、`rst_n`/`sys_rst_n`
+- **已删除**原先加在 `m_axi_*` 上的一批 `set_false_path`——接上 HBM 后
+  它们会掩盖设计中风险最高路径的真实违例；厂商无关构建改用
+  `set_input_delay`/`set_output_delay` 给出 I/O 预算
+- HBM 参考时钟 / APB 时钟已填实（100 MHz），并与 `sys_clk_300mhz`
+  做 `set_clock_groups -asynchronous`
+- 提供 SLR pblock 模板（`hbm_pblock_enable`，默认关闭）：把
+  `argon2_fill` / `cache_hbm_if` / `hbm_dataset_if` / `axi_arbiter` /
+  协议转换器约束到 HBM 所在的底部 SLR。
+  **关键原因**：`argon2_fill` → `cache_hbm_if` 是一条 8192 位块总线，
+  跨 SLR 会消耗大量 SLL 资源。CLOCKREGION 范围与器件相关，
+  需在 Device 视图确认后再启用
+
+### 300 MHz 时序收敛已知风险
+
+| 风险 | 位置 | 对策 |
+|------|------|------|
+| **最高** | `fpu_double.v` 的 FADD/FMUL 单周期组合路径 | 拆成 2~3 级流水（`tb_fpu_double.v` 的 47 项检查必须仍通过） |
+| 高 | `argon2_fill.v` 的 BlaMka 乘加链（32×32 乘 → 64 位加 → 旋转 → 再乘加） | 确认乘法推断成 DSP58；必要时在 `gb` 内插流水（Cache 初始化只做一次，不影响稳态性能） |
+| 中 | `axi_arbiter.v` 的纯组合路由 | 若 timing report 指向仲裁器，在其输出侧插一级 AXI Register Slice |
+| 待评估 | `randomx_vm.v` ↔ `scratchpad_mem` 地址路径 | VM 补全后再评估；注意 URAM 输出寄存器级 |
+
+收敛顺序：先 `make test` / `make lint` 回归 → 综合看
+`report_design_analysis -logic_level_distribution` → 逻辑级数超标的先改 RTL →
+再进实现。WNS 略负（> -0.3 ns）时才值得试
+`Performance_ExplorePostRoutePhysOpt` 策略；差得多（< -1 ns）应回到 RTL。
 
 ---
 
@@ -343,7 +412,7 @@ brew install icarus-verilog
 ### 快速开始（推荐：Makefile）
 ```bash
 make            # 编译并运行全部 testbench（任一 FAIL 则退出码非 0）
-make lint       # Verilator 静态检查（--lint-only -Wall）
+make lint       # Verilator 静态检查（--lint-only -Wall，randomx_top + randomx_hbm_top 两个顶层）
 make syntax     # 逐模块 iverilog 语法检查
 make tb_blake2b # 只运行单个 testbench
 make clean      # 清理仿真产物
@@ -395,6 +464,16 @@ iverilog -g2001 -DSIMULATION -o sim/tb_argon2_fill.vvp \
     rtl/blake2b_core.v rtl/argon2_fill.v sim/tb_argon2_fill.v
 vvp sim/tb_argon2_fill.vvp   # 输出 ALL TESTS PASSED（需在仓库根目录运行）
 
+# 板级顶层单元测试（复位门控 + 34→33 位地址适配自校验）
+iverilog -g2001 -DSIMULATION -o sim/tb_randomx_hbm_top.vvp \
+    rtl/aes_round.v rtl/aes_gen1r.v rtl/aes_gen4r.v rtl/aes_hash1r.v \
+    rtl/blake2b_core.v rtl/scratchpad_mem.v rtl/hbm_dataset_if.v \
+    rtl/cache_hbm_if.v rtl/axi_arbiter.v \
+    rtl/alu_int.v rtl/fpu_double.v rtl/superscalar_hash.v \
+    rtl/argon2_fill.v rtl/randomx_vm.v rtl/randomx_top.v rtl/randomx_hbm_top.v \
+    sim/tb_randomx_hbm_top.v
+vvp sim/tb_randomx_hbm_top.vvp   # 输出 ALL TESTS PASSED
+
 # SuperscalarHash 单元测试（全指令集，比对软件模型）
 iverilog -g2001 -o sim/tb_superscalar_hash.vvp \
     rtl/alu_int.v rtl/superscalar_hash.v sim/tb_superscalar_hash.v
@@ -441,6 +520,7 @@ done
 | `sim/tb_fpu_double.v`      | FADD/FSUB/FMUL/FDIV/FSQRT/FSCAL/FSWAP，含 4 种舍入模式、NaN/Inf/±0、非规格化、上溢/下溢与 `busy` 握手 | PASS（47 项检查）|
 | `sim/tb_argon2_fill.v`     | Argon2d Cache 填充：与 Argon2 参考实现黄金向量逐块比对（m=8/t=3/43 字节 key，m=32/t=1/64 字节 key，m=6→8/t=5/100 字节 key） | PASS |
 | `sim/tb_randomx_top.v`     | 顶层集成冒烟测试：寄存器写种子 → start → 轮询 done → 读回哈希；含行为级 HBM 模型，检查 Cache 块确实写入 HBM | 运行完成（哈希值尚未自校验）|
+| `sim/tb_randomx_hbm_top.v` | 板级顶层：`hbm_init_done` 拉低期间无任何 AXI 地址握手、释放后正常完成、Argon2d 块经 33 位地址总线写入 Cache 窗口、`hbm_addr_err` 保持为 0 | PASS（`ALL TESTS PASSED`）|
 
 > `make test` 会逐个运行上述 testbench，并在输出中出现 `FAIL` / `ERROR` 时返回非 0 退出码。
 
@@ -458,13 +538,14 @@ done
 | 模块              | 状态       | 主要 TODO                                  |
 |------------------|------------|-------------------------------------------|
 | randomx_top.v    | 骨架       | DS_GEN 阶段、完整 AXI-Lite 握手            |
+| randomx_hbm_top.v| **已实现** | 板级引脚约束（依赖具体板卡）                 |
 | blake2b_core.v   | **已实现** | 无（12 轮压缩、init/busy 接口，24 周期/块） |
 | aes_round.v      | **已实现** | 无（SubBytes/ShiftRows/MixColumns/ARK）    |
 | aes_gen1r/4r.v   | 骨架       | 从种子派生正确轮密钥                         |
 | aes_hash1r.v     | 骨架       | 从种子派生正确轮密钥                         |
 | scratchpad_mem.v | **已实现** | 无（URAM 推断、L1/L2/L3 掩码）             |
-| hbm_dataset_if.v | **已实现** | 连接 Vivado HBM IP、写接口接到 superscalar_hash |
-| cache_hbm_if.v   | **已实现** | 连接 Vivado HBM IP（与 dataset 共用端口）    |
+| hbm_dataset_if.v | **已实现** | 写接口接到 superscalar_hash（HBM IP 已由 `randomx_hbm_top` 接通）|
+| cache_hbm_if.v   | **已实现** | 无（HBM IP 经 `randomx_hbm_top` + 协议转换器接通）|
 | axi_arbiter.v    | **已实现** | 无（读/写通路独立 round-robin 仲裁）         |
 | alu_int.v        | 基本实现   | IMUL_RCP（可复用 superscalar_hash 的倒数单元）|
 | fpu_double.v     | **已实现** | 流水化以提升 Fmax（当前加/乘为单周期组合路径）|
@@ -488,8 +569,13 @@ done
    需按 spec 3.3/3.4 从种子派生。
 5. **`alu_int.v` IMUL_RCP** — 2^128 / b 倒数计算。
 6. **验证** — 补齐单元 testbench，并与参考实现做端到端向量对拍。
-7. **后端** — `constraints.xdc` 中的 `PIN_NAME` 占位符、HBM 参考时钟约束、
-   跨时钟域约束；`build.tcl` 中实例化 Vivado HBM IP；验证 300 MHz 时序收敛与资源占用。
+7. **后端** — ~~`build.tcl` 中实例化 Vivado HBM IP、HBM 参考时钟与跨时钟域约束~~
+   **已完成**：新增 `randomx_hbm_top.v`（复位门控 + 地址位宽适配 + 可选 IP 例化）、
+   `build.tcl` 的 `-tclargs hbm` 构建（HBM IP + AXI4→AXI3 协议转换器）、
+   `constraints.xdc` 填实 HBM 时钟/时钟分组并移除掩盖违例的 `m_axi_*` false path，
+   同时提供 SLR pblock 模板。
+   **剩余**：`PACKAGE_PIN` 占位符（依赖具体板卡）、pblock 的 CLOCKREGION 范围确认、
+   `fpu_double` 流水化以真正达成 300 MHz 时序收敛。
 
 ---
 
