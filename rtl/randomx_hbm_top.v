@@ -157,9 +157,9 @@ wire core_rst_n = rst_sync[RST_SYNC_STAGES-1];
 // them, flag any violation so a mis-planned address map is caught on the
 // board instead of showing up as silent data corruption.
 // ---------------------------------------------------------------------------
-wire [33:0] ar_hi_mask = ~(({34{1'b1}}) >> (34 - AXI_ADDR_WIDTH));
-wire ar_addr_ovf = core_arvalid && |(core_araddr & ar_hi_mask);
-wire aw_addr_ovf = core_awvalid && |(core_awaddr & ar_hi_mask);
+wire [33:0] addr_hi_mask = ~(({34{1'b1}}) >> (34 - AXI_ADDR_WIDTH));
+wire ar_addr_ovf = core_arvalid && |(core_araddr & addr_hi_mask);
+wire aw_addr_ovf = core_awvalid && |(core_awaddr & addr_hi_mask);
 
 always @(posedge sys_clk or negedge core_rst_n) begin
     if (!core_rst_n)

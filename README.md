@@ -35,7 +35,7 @@ randomx/
 │   └── randomx_hbm_top.v   # 板级顶层（复位门控 + 地址位宽适配 + HBM IP 例化）
 ├── sim/
 │   ├── tb_randomx_top.v    # 基础功能仿真 testbench
-│   ├── tb_randomx_hbm_top.v# 板级顶层 testbench（复位门控/地址适配自校验）
+│   ├── tb_randomx_hbm_top.v # 板级顶层 testbench（复位门控/地址适配自校验）
 │   ├── tb_blake2b.v        # Blake2b-512 参考测试向量 testbench（含多块/busy）
 │   ├── tb_hbm_dataset_if.v # HBM AXI4 接口 testbench（含 AXI 从设备模型）
 │   ├── tb_cache_hbm_if.v   # Cache 存储接口 testbench（含 AXI 从设备模型）
