@@ -347,6 +347,13 @@ wait_on_run impl_1
 | | `USER_HBM_REF_CLK_0 100` / `USER_APB_PCLK_0 100` | 参考时钟与 APB 配置时钟 |
 | `axi_protocol_converter_0` | `SI_PROTOCOL AXI4` → `MI_PROTOCOL AXI3` | `cache_hbm_if` 发 32 拍突发，HBM 从端口是 AXI3 风格（`awlen` 4 位，最多 16 拍），需拆分 |
 
+> **版本兼容性**：HBM IP 暴露的 `USER_*` 参数随 Vivado 版本变化（例如
+> `USER_HBM_REF_CLK_XTAL_0` 只存在于部分版本）。`build.tcl` 通过
+> `apply_ip_config` 先用 `list_property` 过滤，只设置当前 IP 真正支持的参数，
+> 不支持的参数仅打印 WARNING 并跳过，避免
+> `[Vivado 12-4371] Cannot find parameter ... on IP 'hbm_0'` 导致整个
+> `set_property -dict` 事务回滚、脚本中断。
+
 > **为什么必须开 Global Addressing**：单个 HBM 伪通道只映射 256 MB，而本设计
 > 的 Dataset 在 `0x0_0000_0000`（~2.08 GiB）、Cache 在 `0x0_C000_0000`（256 MiB）。
 > 不开内部 AXI Switch 时，`0xC000_0000` 的 Cache 访问会返回 DECERR，

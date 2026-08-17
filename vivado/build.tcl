@@ -136,24 +136,51 @@ if {$hbm_enable} {
     # port" to "instantiate hbm_0 + axi_protocol_converter_0".
     set_property verilog_define {HBM_IP=1} [get_filesets sources_1]
 
+    # Sets only the CONFIG.* parameters that the installed IP version actually
+    # exposes. Parameters that do not exist are skipped with a warning instead
+    # of aborting the build (Vivado applies -dict atomically, so a single
+    # unknown parameter would otherwise discard the whole configuration).
+    proc apply_ip_config {ip cfg_dict} {
+        set supported [list_property $ip]
+        set applied   [list]
+        foreach {param value} $cfg_dict {
+            if {[lsearch -exact $supported $param] >= 0} {
+                lappend applied $param $value
+            } else {
+                puts "WARNING: parameter '$param' is not supported by this Vivado/IP version — skipped."
+            }
+        }
+        if {[llength $applied]} {
+            set_property -dict $applied $ip
+        }
+    }
+
     # -- AXI4 (32-beat bursts from cache_hbm_if) -> AXI3 (16-beat maximum) --
     create_ip -name axi_protocol_converter -vendor xilinx.com -library ip \
               -module_name axi_protocol_converter_0
-    set_property -dict [list \
+    apply_ip_config [get_ips axi_protocol_converter_0] [list \
         CONFIG.ADDR_WIDTH        ${hbm_axi_addr_width} \
         CONFIG.DATA_WIDTH        256                   \
         CONFIG.ID_WIDTH          1                     \
         CONFIG.SI_PROTOCOL       AXI4                  \
         CONFIG.MI_PROTOCOL       AXI3                  \
         CONFIG.TRANSLATION_MODE  2                     \
-    ] [get_ips axi_protocol_converter_0]
+    ]
 
     # -- HBM controller --------------------------------------------------
     # Stack 0 only (XCVU33P has a single 4 GB HBM2 stack), one AXI port
     # enabled, internal switch ON so that the single port can reach the whole
     # stack (Global Addressing — see the header comment).
+    #
+    # NOTE: the exact set of USER_* parameters exposed by the HBM IP differs
+    # between Vivado releases (for example USER_HBM_REF_CLK_XTAL_0 only exists
+    # in some versions). Setting a parameter the installed IP does not know
+    # about aborts the whole -dict transaction with
+    #   [Vivado 12-4371] Cannot find parameter '...' on IP 'hbm_0'
+    # so every parameter is filtered against the IP's actual property list
+    # first and unknown ones are only reported as a warning.
     create_ip -name hbm -vendor xilinx.com -library ip -module_name hbm_0
-    set_property -dict [list \
+    apply_ip_config [get_ips hbm_0] [list \
         CONFIG.USER_HBM_DENSITY              4GB            \
         CONFIG.USER_HBM_STACK                1              \
         CONFIG.USER_SAXI_00                  true           \
@@ -164,7 +191,7 @@ if {$hbm_enable} {
         CONFIG.USER_HBM_FBDIV_0              12             \
         CONFIG.USER_MC_ENABLE_00             true           \
         CONFIG.USER_AXI_CLK_FREQ             ${hbm_axi_clk_mhz} \
-    ] [get_ips hbm_0]
+    ]
 
     # Generate the output products; without this the modules stay black boxes.
     foreach ip {axi_protocol_converter_0 hbm_0} {
