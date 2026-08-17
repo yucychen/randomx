@@ -35,6 +35,9 @@ RTL_SRCS := \
 	$(RTL_DIR)/randomx_vm.v \
 	$(RTL_DIR)/randomx_top.v
 
+# 板级顶层（HBM IP 封装层，不属于 randomx_top 的 lint 范围）
+BOARD_SRCS := $(RTL_DIR)/randomx_hbm_top.v
+
 # 每个 testbench 需要的 RTL 子集
 SRCS_tb_blake2b         := $(RTL_DIR)/blake2b_core.v
 SRCS_tb_hbm_dataset_if  := $(RTL_DIR)/hbm_dataset_if.v
@@ -43,9 +46,10 @@ SRCS_tb_superscalar_hash:= $(RTL_DIR)/alu_int.v $(RTL_DIR)/superscalar_hash.v
 SRCS_tb_fpu_double      := $(RTL_DIR)/fpu_double.v
 SRCS_tb_argon2_fill     := $(RTL_DIR)/blake2b_core.v $(RTL_DIR)/argon2_fill.v
 SRCS_tb_randomx_top     := $(RTL_SRCS)
+SRCS_tb_randomx_hbm_top := $(RTL_SRCS) $(BOARD_SRCS)
 
 TESTS := tb_blake2b tb_hbm_dataset_if tb_cache_hbm_if tb_superscalar_hash \
-         tb_fpu_double tb_argon2_fill tb_randomx_top
+         tb_fpu_double tb_argon2_fill tb_randomx_top tb_randomx_hbm_top
 
 .PHONY: all test lint syntax clean $(TESTS)
 
@@ -85,6 +89,8 @@ LINT_WAIVERS := -Wno-DECLFILENAME -Wno-UNUSEDSIGNAL -Wno-UNUSEDPARAM \
 lint:
 	$(VERILATOR) --lint-only -Wall $(LINT_WAIVERS) \
 		+define+SIMULATION --top-module randomx_top $(RTL_SRCS)
+	$(VERILATOR) --lint-only -Wall $(LINT_WAIVERS) \
+		+define+SIMULATION --top-module randomx_hbm_top $(RTL_SRCS) $(BOARD_SRCS)
 
 ## 逐模块语法检查（-y rtl 自动查找子模块）
 syntax:
