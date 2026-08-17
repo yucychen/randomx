@@ -10,13 +10,24 @@
 #   1. Creates a new Vivado project for part xcvu33p-fsvh2104-2L-e
 #   2. Adds all RTL sources (Verilog-2001)
 #   3. Adds simulation sources
-#   4. Sets the top module to randomx_top
-#   5. Adds constraints (clock, HBM placeholder)
-#   6. Launches synthesis (out-of-context is acceptable for timing closure)
+#   4. Optionally creates the HBM IP + AXI Protocol Converter (hbm_enable)
+#   5. Sets the top module (randomx_hbm_top with HBM, randomx_top without)
+#   6. Adds constraints (clocks, HBM, SLR pblocks)
+#   7. Launches synthesis (out-of-context is acceptable for timing closure)
 #
-# Note: Full implementation (place & route) is NOT run automatically because
-# HBM IP connections require manual configuration of the Xilinx HBM IP.
-# See README.md for next steps after synthesis.
+# HBM build (set hbm_enable to 1 below, or pass -tclargs hbm):
+#   * Creates hbm_0 with a single AXI port and the internal AXI switch
+#     (Global Addressing) enabled. Global Addressing is mandatory: the design
+#     places the Dataset at 0x0_0000_0000 (~2.08 GiB) and the Cache at
+#     0x0_C000_0000 (256 MiB), both far outside the 256 MB window a single
+#     pseudo-channel covers on its own.
+#   * Creates axi_protocol_converter_0 (AXI4 -> AXI3) because cache_hbm_if
+#     issues 32-beat bursts while the HBM AXI slave port is AXI3-style with a
+#     4-bit AWLEN/ARLEN (16 beats maximum).
+#   * Defines the HBM_IP Verilog macro so rtl/randomx_hbm_top.v instantiates
+#     both IPs instead of exposing the AXI port at the boundary.
+#
+# Implementation (place & route) requires an HBM IP licence; synthesis does not.
 # =============================================================================
 
 # ---------------------------------------------------------------------------
@@ -25,7 +36,31 @@
 set project_name "randomx_xcvu33p"
 set project_dir  [file normalize "[file dirname [info script]]/../vivado_work"]
 set part_name    "xcvu33p-fsvh2104-2L-e"
-set top_module   "randomx_top"
+
+# ---------------------------------------------------------------------------
+# HBM build switch
+#   0 — vendor-neutral build: top = randomx_top, the AXI4 master stays at the
+#       boundary (fast elaboration / synthesis checks, no IP, no licence).
+#   1 — board build: top = randomx_hbm_top, HBM IP + protocol converter are
+#       created and connected. Enable with: vivado -mode batch -source \
+#       vivado/build.tcl -tclargs hbm
+# ---------------------------------------------------------------------------
+set hbm_enable 0
+if {[llength $argv] > 0 && [lsearch -exact $argv "hbm"] >= 0} {
+    set hbm_enable 1
+}
+
+# AXI slave address width of the HBM stack (33 bits = 4 GB).
+set hbm_axi_addr_width 33
+# HBM AXI port clock. Keep it equal to the 300 MHz core clock for the first
+# bring-up so that no AXI Clock Converter and no CDC constraints are needed.
+set hbm_axi_clk_mhz 300
+
+if {$hbm_enable} {
+    set top_module "randomx_hbm_top"
+} else {
+    set top_module "randomx_top"
+}
 
 # RTL source files (relative to project build.tcl location)
 set rtl_dir [file normalize "[file dirname [info script]]/../rtl"]
@@ -49,6 +84,10 @@ set rtl_files [list \
     "${rtl_dir}/randomx_vm.v"      \
     "${rtl_dir}/randomx_top.v"     \
 ]
+
+# Board-level top (wraps randomx_top for the HBM IP). Always added as a source
+# so that it is elaborated/checked; it only becomes the top when hbm_enable=1.
+lappend rtl_files "${rtl_dir}/randomx_hbm_top.v"
 
 set sim_files [list \
     "${sim_dir}/tb_randomx_top.v"  \
@@ -86,6 +125,61 @@ foreach src ${rtl_files} {
 
 # Set top module
 set_property top ${top_module} [current_fileset]
+
+# ---------------------------------------------------------------------------
+# HBM IP + AXI Protocol Converter
+# ---------------------------------------------------------------------------
+if {$hbm_enable} {
+    puts "INFO: Creating HBM IP and AXI protocol converter..."
+
+    # The HBM_IP macro switches rtl/randomx_hbm_top.v from "expose the AXI
+    # port" to "instantiate hbm_0 + axi_protocol_converter_0".
+    set_property verilog_define {HBM_IP=1} [get_filesets sources_1]
+
+    # -- AXI4 (32-beat bursts from cache_hbm_if) -> AXI3 (16-beat maximum) --
+    create_ip -name axi_protocol_converter -vendor xilinx.com -library ip \
+              -module_name axi_protocol_converter_0
+    set_property -dict [list \
+        CONFIG.ADDR_WIDTH        ${hbm_axi_addr_width} \
+        CONFIG.DATA_WIDTH        256                   \
+        CONFIG.ID_WIDTH          1                     \
+        CONFIG.SI_PROTOCOL       AXI4                  \
+        CONFIG.MI_PROTOCOL       AXI3                  \
+        CONFIG.TRANSLATION_MODE  2                     \
+    ] [get_ips axi_protocol_converter_0]
+
+    # -- HBM controller --------------------------------------------------
+    # Stack 0 only (XCVU33P has a single 4 GB HBM2 stack), one AXI port
+    # enabled, internal switch ON so that the single port can reach the whole
+    # stack (Global Addressing — see the header comment).
+    create_ip -name hbm -vendor xilinx.com -library ip -module_name hbm_0
+    set_property -dict [list \
+        CONFIG.USER_HBM_DENSITY              4GB            \
+        CONFIG.USER_HBM_STACK                1              \
+        CONFIG.USER_SAXI_00                  true           \
+        CONFIG.USER_SWITCH_ENABLE_00         true           \
+        CONFIG.USER_HBM_REF_CLK_0            100            \
+        CONFIG.USER_HBM_REF_CLK_XTAL_0       100            \
+        CONFIG.USER_APB_PCLK_0               100            \
+        CONFIG.USER_HBM_FBDIV_0              12             \
+        CONFIG.USER_MC_ENABLE_00             true           \
+        CONFIG.USER_AXI_CLK_FREQ             ${hbm_axi_clk_mhz} \
+    ] [get_ips hbm_0]
+
+    # Generate the output products; without this the modules stay black boxes.
+    foreach ip {axi_protocol_converter_0 hbm_0} {
+        generate_target all [get_ips $ip]
+        create_ip_run [get_ips $ip]
+    }
+    launch_runs axi_protocol_converter_0_synth_1 hbm_0_synth_1 -jobs 4
+    wait_on_run axi_protocol_converter_0_synth_1
+    wait_on_run hbm_0_synth_1
+
+    puts "INFO: HBM IP generated. NOTE: implementation requires an HBM licence."
+} else {
+    puts "INFO: hbm_enable = 0 — building the vendor-neutral top (${top_module})."
+    puts "INFO: re-run with '-tclargs hbm' to build against the HBM IP."
+}
 
 # ---------------------------------------------------------------------------
 # Add simulation sources
@@ -126,12 +220,20 @@ synth_design -rtl -rtl_skip_mlo -name rtl_1
 
 puts ""
 puts "============================================================"
-puts " Elaboration complete."
-puts " To run full synthesis, execute in Tcl console:"
-puts "   launch_runs synth_1 -jobs 8"
-puts "   wait_on_run synth_1"
-puts " To open the elaborated schematic:"
-puts "   show_schematic [get_cells -hierarchical *]"
+puts " Elaboration complete. Top module: ${top_module}"
+puts " HBM IP: [expr {$hbm_enable ? {enabled} : {disabled}}]"
+puts ""
+puts " Timing closure flow (300 MHz target, see README):"
+puts "   1. launch_runs synth_1 -jobs 8; wait_on_run synth_1"
+puts "   2. open_run synth_1 -name synth_1"
+puts "      report_timing_summary"
+puts "      report_utilization"
+puts "      report_design_analysis -logic_level_distribution"
+puts "      -> paths with more than ~8 logic levels will not close at"
+puts "         300 MHz; fix them in RTL before running implementation."
+puts "   3. launch_runs impl_1 -jobs 8; wait_on_run impl_1  (needs HBM licence)"
+puts "   4. If WNS is only slightly negative, retry with the strategy"
+puts "      Performance_ExplorePostRoutePhysOpt."
 puts "============================================================"
 
 # Uncomment to launch full synthesis automatically:
@@ -143,3 +245,5 @@ puts "============================================================"
 # open_run synth_1 -name synth_1
 # report_utilization -file ${project_dir}/utilization_synth.rpt
 # report_timing_summary -file ${project_dir}/timing_synth.rpt
+# report_design_analysis -logic_level_distribution \
+#     -file ${project_dir}/logic_levels_synth.rpt
