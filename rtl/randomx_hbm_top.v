@@ -262,6 +262,7 @@ axi_protocol_converter_0 u_axi4_to_axi3 (
     .s_axi_awcache  (4'b0011),
     .s_axi_awprot   (3'b000),
     .s_axi_awqos    (4'b0000),
+    .s_axi_awregion (4'b0000),
     .s_axi_awvalid  (core_awvalid),
     .s_axi_awready  (core_awready),
     .s_axi_wdata    (core_wdata),
@@ -282,6 +283,7 @@ axi_protocol_converter_0 u_axi4_to_axi3 (
     .s_axi_arcache  (4'b0011),
     .s_axi_arprot   (3'b000),
     .s_axi_arqos    (4'b0000),
+    .s_axi_arregion (4'b0000),
     .s_axi_arvalid  (core_arvalid),
     .s_axi_arready  (core_arready),
     .s_axi_rid      (),
@@ -373,7 +375,58 @@ hbm_0 u_hbm (
     .AXI_00_BID       (),
     .AXI_00_BRESP     (pc_bresp),
     .AXI_00_BVALID    (pc_bvalid),
-    .AXI_00_BREADY    (pc_bready)
+    .AXI_00_BREADY    (pc_bready),
+
+    // -----------------------------------------------------------------
+    // Unused pseudo-channel AXI_01.
+    //
+    // The HBM IP exposes AXI ports in pairs: enabling memory controller 0
+    // (USER_MC_ENABLE_00) brings out both pseudo-channel ports AXI_00 and
+    // AXI_01, even though only AXI_00 is used here (Global Addressing lets
+    // that single port reach the whole stack). Leaving the second port
+    // floating produces
+    //   CRITICAL WARNING: [Synth 8-4442] BlackBox module u_hbm has
+    //   unconnected pin AXI_01_...
+    // so every input of the port is tied off explicitly: clock and reset are
+    // driven like AXI_00 (an AXI port with a free-running clock and a released
+    // reset but no traffic is harmless), all request/response handshakes are
+    // held inactive and the payload buses are zeroed.
+    // -----------------------------------------------------------------
+    .AXI_01_ACLK      (sys_clk),
+    .AXI_01_ARESET_N  (core_rst_n),
+
+    .AXI_01_ARADDR    ({AXI_ADDR_WIDTH{1'b0}}),
+    .AXI_01_ARBURST   (2'b01),
+    .AXI_01_ARID      (6'b0),
+    .AXI_01_ARLEN     (4'b0),
+    .AXI_01_ARSIZE    (3'b101),
+    .AXI_01_ARVALID   (1'b0),
+    .AXI_01_ARREADY   (),
+    .AXI_01_RDATA     (),
+    .AXI_01_RDATA_PARITY (),
+    .AXI_01_RID       (),
+    .AXI_01_RLAST     (),
+    .AXI_01_RRESP     (),
+    .AXI_01_RVALID    (),
+    .AXI_01_RREADY    (1'b0),
+
+    .AXI_01_AWADDR    ({AXI_ADDR_WIDTH{1'b0}}),
+    .AXI_01_AWBURST   (2'b01),
+    .AXI_01_AWID      (6'b0),
+    .AXI_01_AWLEN     (4'b0),
+    .AXI_01_AWSIZE    (3'b101),
+    .AXI_01_AWVALID   (1'b0),
+    .AXI_01_AWREADY   (),
+    .AXI_01_WDATA     (256'b0),
+    .AXI_01_WDATA_PARITY (32'b0),
+    .AXI_01_WSTRB     (32'b0),
+    .AXI_01_WLAST     (1'b0),
+    .AXI_01_WVALID    (1'b0),
+    .AXI_01_WREADY    (),
+    .AXI_01_BID       (),
+    .AXI_01_BRESP     (),
+    .AXI_01_BVALID    (),
+    .AXI_01_BREADY    (1'b0)
 );
 
 `else

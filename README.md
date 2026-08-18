@@ -373,6 +373,13 @@ wait_on_run impl_1
 3. **可选 IP 例化**：由 `HBM_IP` 宏控制。未定义时（仿真 / lint / `make syntax`）
    AXI 端口暴露在边界上，可继续复用现有的行为级 HBM 模型；
    定义时（`build.tcl` 自动设置）转而驱动 `hbm_0` 与 `axi_protocol_converter_0`。
+4. **黑盒引脚全连接**：IP 的输入引脚若悬空，综合会报
+   `CRITICAL WARNING: [Synth 8-4442] BlackBox module ... has unconnected pin ...`。
+   因此显式接好两处：协议转换器的 `s_axi_awregion` / `s_axi_arregion`（接 0）；
+   以及 HBM IP 的 **`AXI_01` 伪通道端口**——HBM IP 的 AXI 端口成对出现，
+   打开控制器 0（`USER_MC_ENABLE_00`）会同时引出 `AXI_00` 与 `AXI_01`，
+   本设计只用 `AXI_00`（靠 Global Addressing 覆盖整个堆栈），
+   `AXI_01` 的时钟/复位照常驱动、握手信号全部拉低、数据总线清零。
 
 ### 约束说明（`vivado/constraints.tcl` + `vivado/constraints.xdc`）
 
