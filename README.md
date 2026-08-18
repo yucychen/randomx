@@ -44,7 +44,8 @@ randomx/
 │   └── tb_superscalar_hash.v # SuperscalarHash 全指令集 testbench
 ├── vivado/
 │   ├── build.tcl           # Vivado TCL 构建脚本（含 HBM IP / 协议转换器创建）
-│   └── constraints.xdc     # 时序约束（300 MHz + HBM 时钟 + SLR pblock）
+│   ├── constraints.xdc     # 静态约束（引脚 / IOSTANDARD 占位，纯 XDC 命令）
+│   └── constraints.tcl     # 脚本化约束（300 MHz + HBM 时钟 + SLR pblock）
 ├── .github/workflows/ci.yml# CI：语法检查 + 全部 testbench + Verilator lint
 ├── Makefile                # 编译 / 仿真 / lint 自动化
 └── README.md               # 本文档
@@ -373,9 +374,17 @@ wait_on_run impl_1
    AXI 端口暴露在边界上，可继续复用现有的行为级 HBM 模型；
    定义时（`build.tcl` 自动设置）转而驱动 `hbm_0` 与 `axi_protocol_converter_0`。
 
-### 约束说明（`vivado/constraints.xdc`）
+### 约束说明（`vivado/constraints.tcl` + `vivado/constraints.xdc`）
 
-- 同一份 XDC 同时适配两种顶层：通过 `get_ports -quiet` 判断端口是否存在，
+- **文件分工**：Vivado 以「约束模式」解析 `.xdc`，其中不允许 `if` / `foreach`
+  等 Tcl 控制流，否则报
+  `CRITICAL WARNING: [Designutils 20-1307] Command 'if' is not supported in the
+  xdc constraint file`，并且被包住的约束会被**静默丢弃**（等于没有约束）。
+  因此所有带条件的约束放在 `constraints.tcl`，由 `build.tcl` 以
+  `file_type TCL` 加入 `constrs_1`（整份文件按 Tcl 脚本 source）；
+  `constraints.xdc` 只保留纯静态 XDC 命令，并继续作为 target constraints file
+  （GUI 写回的引脚约束落在这里）
+- 同一份脚本同时适配两种顶层：通过 `get_ports -quiet` 判断端口是否存在，
   自动匹配 `clk`/`sys_clk`、`rst_n`/`sys_rst_n`
 - **已删除**原先加在 `m_axi_*` 上的一批 `set_false_path`——接上 HBM 后
   它们会掩盖设计中风险最高路径的真实违例；厂商无关构建改用
@@ -579,7 +588,7 @@ done
 7. **后端** — ~~`build.tcl` 中实例化 Vivado HBM IP、HBM 参考时钟与跨时钟域约束~~
    **已完成**：新增 `randomx_hbm_top.v`（复位门控 + 地址位宽适配 + 可选 IP 例化）、
    `build.tcl` 的 `-tclargs hbm` 构建（HBM IP + AXI4→AXI3 协议转换器）、
-   `constraints.xdc` 填实 HBM 时钟/时钟分组并移除掩盖违例的 `m_axi_*` false path，
+   `constraints.tcl` 填实 HBM 时钟/时钟分组并移除掩盖违例的 `m_axi_*` false path，
    同时提供 SLR pblock 模板。
    **剩余**：`PACKAGE_PIN` 占位符（依赖具体板卡）、pblock 的 CLOCKREGION 范围确认、
    `fpu_double` 流水化以真正达成 300 MHz 时序收敛。

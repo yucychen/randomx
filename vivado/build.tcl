@@ -97,6 +97,14 @@ set xdc_files [list \
     "${xdc_dir}/constraints.xdc"   \
 ]
 
+# Constraints that need Tcl control flow (they adapt to the build flavour) must
+# live in a .tcl script: Vivado reads .xdc files in constraint mode, where
+# 'if'/'foreach' raise "[Designutils 20-1307] Command 'if' is not supported in
+# the xdc constraint file" and the guarded constraints are silently dropped.
+set constr_tcl_files [list \
+    "${xdc_dir}/constraints.tcl"   \
+]
+
 # ---------------------------------------------------------------------------
 # Create project
 # ---------------------------------------------------------------------------
@@ -224,6 +232,17 @@ set_property verilog_define {SIMULATION=1} [get_filesets sim_1]
 puts "INFO: Adding constraints..."
 add_files -fileset constrs_1 ${xdc_files}
 set_property target_constrs_file [lindex ${xdc_files} 0] [current_fileset -constrset]
+
+# Scripted constraints: added as TCL so that Vivado sources them as a full Tcl
+# script (control flow allowed) instead of parsing them in XDC mode.
+add_files -fileset constrs_1 ${constr_tcl_files}
+foreach ctcl ${constr_tcl_files} {
+    set cfile [get_files -of_objects [get_filesets constrs_1] $ctcl]
+    set_property file_type TCL $cfile
+    set_property USED_IN {synthesis implementation out_of_context} $cfile
+    # Run after the static XDC so GUI-written pin/IO constraints are in place.
+    set_property PROCESSING_ORDER LATE $cfile
+}
 
 # ---------------------------------------------------------------------------
 # Synthesis settings
