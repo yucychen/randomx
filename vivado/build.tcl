@@ -106,6 +106,27 @@ set constr_tcl_files [list \
 ]
 
 # ---------------------------------------------------------------------------
+# Sets only the CONFIG.* parameters that the installed IP version actually
+# exposes. Parameters that do not exist are skipped with a warning instead of
+# aborting the build (Vivado applies -dict atomically, so a single unknown
+# parameter would otherwise discard the whole configuration).
+# ---------------------------------------------------------------------------
+proc apply_ip_config {ip cfg_dict} {
+    set supported [list_property $ip]
+    set applied   [list]
+    foreach {param value} $cfg_dict {
+        if {[lsearch -exact $supported $param] >= 0} {
+            lappend applied $param $value
+        } else {
+            puts "WARNING: parameter '$param' is not supported by this Vivado/IP version — skipped."
+        }
+    }
+    if {[llength $applied]} {
+        set_property -dict $applied $ip
+    }
+}
+
+# ---------------------------------------------------------------------------
 # Create project
 # ---------------------------------------------------------------------------
 puts "INFO: Creating project '${project_name}' for part '${part_name}'"
@@ -143,25 +164,6 @@ if {$hbm_enable} {
     # The HBM_IP macro switches rtl/randomx_hbm_top.v from "expose the AXI
     # port" to "instantiate hbm_0 + axi_protocol_converter_0".
     set_property verilog_define {HBM_IP=1} [get_filesets sources_1]
-
-    # Sets only the CONFIG.* parameters that the installed IP version actually
-    # exposes. Parameters that do not exist are skipped with a warning instead
-    # of aborting the build (Vivado applies -dict atomically, so a single
-    # unknown parameter would otherwise discard the whole configuration).
-    proc apply_ip_config {ip cfg_dict} {
-        set supported [list_property $ip]
-        set applied   [list]
-        foreach {param value} $cfg_dict {
-            if {[lsearch -exact $supported $param] >= 0} {
-                lappend applied $param $value
-            } else {
-                puts "WARNING: parameter '$param' is not supported by this Vivado/IP version — skipped."
-            }
-        }
-        if {[llength $applied]} {
-            set_property -dict $applied $ip
-        }
-    }
 
     # -- AXI4 (32-beat bursts from cache_hbm_if) -> AXI3 (16-beat maximum) --
     create_ip -name axi_protocol_converter -vendor xilinx.com -library ip \
