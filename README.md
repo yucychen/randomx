@@ -320,6 +320,17 @@ vivado -mode batch -source vivado/build.tcl            # 厂商无关
 vivado -mode batch -source vivado/build.tcl -tclargs hbm  # 板级（含 HBM IP）
 ```
 
+> 上面两条是**操作系统命令行**（cmd / PowerShell / bash）中的命令，不能直接粘贴到
+> Vivado GUI 的 Tcl Console。若在 Tcl Console 中输入，会得到
+> `Unknown Tcl command 'vivado -mode batch -source ...' sending command to the OS
+> shell for execution`（此时 Vivado 已在运行，无需再启动一次）。
+> 在 Vivado GUI 的 Tcl Console 中请改用 `source`：
+>
+> ```tcl
+> source E:/project/vivado/randomx/vivado/build.tcl                      ;# 厂商无关
+> set hbm_enable 1; source E:/project/vivado/randomx/vivado/build.tcl    ;# 板级
+> ```
+
 **2. 查看综合结果**
 ```tcl
 open_run synth_1 -name synth_1

@@ -2,9 +2,16 @@
 # build.tcl — Vivado Project Build Script
 # RandomX FPGA Framework — Xilinx Virtex UltraScale+ XCVU33P
 #
-# Usage (Vivado Tcl console or batch mode):
-#   vivado -mode batch -source build.tcl
-#   OR open Vivado GUI → Tcl Console → source vivado/build.tcl
+# Usage:
+#   * OS shell (cmd/PowerShell/bash — NOT the Vivado Tcl console):
+#       vivado -mode batch -source vivado/build.tcl
+#       vivado -mode batch -source vivado/build.tcl -tclargs hbm
+#   * Vivado GUI → Tcl Console (Vivado is already running, so do not type the
+#     "vivado -mode batch ..." command there — it is a shell command, and the
+#     console answers with "Unknown Tcl command ... sending command to the OS
+#     shell for execution"):
+#       source E:/path/to/randomx/vivado/build.tcl            ;# vendor-neutral
+#       set hbm_enable 1; source E:/path/to/randomx/vivado/build.tcl  ;# HBM
 #
 # What this script does:
 #   1. Creates a new Vivado project for part xcvu33p-fsvh2104-2L-e
@@ -42,11 +49,17 @@ set part_name    "xcvu33p-fsvh2104-2L-e"
 #   0 — vendor-neutral build: top = randomx_top, the AXI4 master stays at the
 #       boundary (fast elaboration / synthesis checks, no IP, no licence).
 #   1 — board build: top = randomx_hbm_top, HBM IP + protocol converter are
-#       created and connected. Enable with: vivado -mode batch -source \
-#       vivado/build.tcl -tclargs hbm
+#       created and connected. Enable with either
+#         vivado -mode batch -source vivado/build.tcl -tclargs hbm   (OS shell)
+#       or, in the Vivado Tcl console,
+#         set hbm_enable 1; source .../vivado/build.tcl
 # ---------------------------------------------------------------------------
-set hbm_enable 0
-if {[llength $argv] > 0 && [lsearch -exact $argv "hbm"] >= 0} {
+if {![info exists hbm_enable]} {
+    set hbm_enable 0
+}
+# argv only exists in batch/tclargs mode; it is absent when sourcing from the
+# Vivado GUI Tcl console.
+if {[info exists argv] && [lsearch -exact $argv "hbm"] >= 0} {
     set hbm_enable 1
 }
 
