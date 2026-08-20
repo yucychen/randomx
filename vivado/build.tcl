@@ -222,18 +222,15 @@ if {$hbm_enable} {
         lappend hbm_cfg [format {CONFIG.USER_MC_ENABLE_%02d} $mc] true
     }
 
-    # AXI slave ports. The IP enables all 16 ports of the stack by default, and
-    # every port it exposes that randomx_hbm_top.v does not drive shows up as
-    #   CRITICAL WARNING: [Synth 8-4442] BlackBox module u_hbm has unconnected
-    #   pin AXI_02_...
-    # Only AXI_00 carries traffic; AXI_01 is kept (and tied off in RTL) because
-    # the IP exposes pseudo-channel ports in pairs per memory controller, and
-    # ports 02..31 are disabled so that they are not part of the black box at
-    # all. Disabling a port does not restrict the address range reachable
-    # through AXI_00 — that is the job of the switch enabled above.
+    # AXI slave ports. The HBM controller is hardened, so its wrapper exposes
+    # all 16 AXI slave ports of the stack regardless of this setting; keeping
+    # ports 00..15 enabled makes the black-box port list deterministic and
+    # matches the tie-offs in rtl/randomx_hbm_top.v (only AXI_00 carries
+    # traffic — the switch enabled above gives it access to the whole stack).
+    # Ports 16..31 belong to the second stack, which XCVU33P does not have.
     for {set port 0} {$port < 32} {incr port} {
         lappend hbm_cfg [format {CONFIG.USER_SAXI_%02d} $port] \
-                        [expr {$port < 2 ? "true" : "false"}]
+                        [expr {$port < 16 ? "true" : "false"}]
     }
 
     apply_ip_config [get_ips hbm_0] $hbm_cfg
