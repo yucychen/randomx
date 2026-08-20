@@ -391,6 +391,10 @@ hbm_0 u_hbm (
     // driven like AXI_00 (an AXI port with a free-running clock and a released
     // reset but no traffic is harmless), all request/response handshakes are
     // held inactive and the payload buses are zeroed.
+    //
+    // The remaining ports of the stack (AXI_02 … AXI_15) are switched off in
+    // vivado/build.tcl (CONFIG.USER_SAXI_02 … USER_SAXI_31 = false) so that
+    // they are not part of the black box and need no tie-offs here.
     // -----------------------------------------------------------------
     .AXI_01_ACLK      (sys_clk),
     .AXI_01_ARESET_N  (core_rst_n),

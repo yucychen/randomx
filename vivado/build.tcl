@@ -203,18 +203,40 @@ if {$hbm_enable} {
     # so every parameter is filtered against the IP's actual property list
     # first and unknown ones are only reported as a warning.
     create_ip -name hbm -vendor xilinx.com -library ip -module_name hbm_0
-    apply_ip_config [get_ips hbm_0] [list \
+
+    set hbm_cfg [list \
         CONFIG.USER_HBM_DENSITY              4GB            \
         CONFIG.USER_HBM_STACK                1              \
-        CONFIG.USER_SAXI_00                  true           \
         CONFIG.USER_SWITCH_ENABLE_00         true           \
         CONFIG.USER_HBM_REF_CLK_0            100            \
         CONFIG.USER_HBM_REF_CLK_XTAL_0       100            \
         CONFIG.USER_APB_PCLK_0               100            \
         CONFIG.USER_HBM_FBDIV_0              12             \
-        CONFIG.USER_MC_ENABLE_00             true           \
         CONFIG.USER_AXI_CLK_FREQ             ${hbm_axi_clk_mhz} \
     ]
+
+    # All eight memory controllers of stack 0 stay enabled: with Global
+    # Addressing the single AXI port must be able to reach every pseudo-channel
+    # of the 4 GB stack, which is only possible when no MC is switched off.
+    for {set mc 0} {$mc < 8} {incr mc} {
+        lappend hbm_cfg [format {CONFIG.USER_MC_ENABLE_%02d} $mc] true
+    }
+
+    # AXI slave ports. The IP enables all 16 ports of the stack by default, and
+    # every port it exposes that randomx_hbm_top.v does not drive shows up as
+    #   CRITICAL WARNING: [Synth 8-4442] BlackBox module u_hbm has unconnected
+    #   pin AXI_02_...
+    # Only AXI_00 carries traffic; AXI_01 is kept (and tied off in RTL) because
+    # the IP exposes pseudo-channel ports in pairs per memory controller, and
+    # ports 02..31 are disabled so that they are not part of the black box at
+    # all. Disabling a port does not restrict the address range reachable
+    # through AXI_00 — that is the job of the switch enabled above.
+    for {set port 0} {$port < 32} {incr port} {
+        lappend hbm_cfg [format {CONFIG.USER_SAXI_%02d} $port] \
+                        [expr {$port < 2 ? "true" : "false"}]
+    }
+
+    apply_ip_config [get_ips hbm_0] $hbm_cfg
 
     # Generate the output products; without this the modules stay black boxes.
     foreach ip {axi_protocol_converter_0 hbm_0} {
