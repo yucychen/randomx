@@ -468,13 +468,26 @@ aes_hash1r u_aes_hash (
 );
 
 // --- RandomX VM ---
-randomx_vm u_vm (
+randomx_vm #(
+`ifdef SIMULATION
+    // Simulation build: 4 VM iterations and the reduced scratchpad depth of
+    // scratchpad_mem (4096 × 64-bit) so the testbench finishes quickly.
+    .ITERATIONS (4),
+    .SP_WORDS   (4096)
+`else
+    .ITERATIONS (2048),
+    .SP_WORDS   (262144)
+`endif
+) u_vm (
     .clk           (clk),
     .rst_n         (rst_n),
     .start         (vm_start),
     .prog_wr_en    (1'b0),     // TODO: Program loaded via AXI register writes
     .prog_wr_addr  (8'b0),
     .prog_wr_data  (64'b0),
+    .cfg_wr_en     (1'b0),     // TODO: Program entropy from AesGenerator4R
+    .cfg_wr_addr   (4'b0),
+    .cfg_wr_data   (64'b0),
     .sp_rd_en      (sp_rd_en),
     .sp_rd_addr    (sp_rd_addr),
     .sp_rd_level   (sp_rd_level),

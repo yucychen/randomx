@@ -5,7 +5,7 @@
 > **状态：部分实现**  
 > 所有模块均可使用 `iverilog -g2001` 编译并通过仿真。
 > `blake2b_core` / `aes_round` / `scratchpad_mem` / `hbm_dataset_if` / `cache_hbm_if` /
-> `axi_arbiter` / `superscalar_hash` / `fpu_double` / `argon2_fill`
+> `axi_arbiter` / `superscalar_hash` / `fpu_double` / `argon2_fill` / `randomx_vm`
 > 已完整实现并有单元测试覆盖（见 [单元测试状态](#单元测试状态)）；
 > 其余模块为骨架，功能逻辑以 `TODO` 注释标注，待完整实现。
 
@@ -40,6 +40,7 @@ randomx/
 │   ├── tb_hbm_dataset_if.v # HBM AXI4 接口 testbench（含 AXI 从设备模型）
 │   ├── tb_cache_hbm_if.v   # Cache 存储接口 testbench（含 AXI 从设备模型）
 │   ├── tb_argon2_fill.v    # Argon2d 填充 testbench（黄金向量比对）
+│   ├── tb_randomx_vm.v     # RandomX VM testbench（指令集/主循环自校验）
 │   ├── tb_fpu_double.v     # 双精度浮点单元 testbench
 │   └── tb_superscalar_hash.v # SuperscalarHash 全指令集 testbench
 ├── vivado/
@@ -219,6 +220,35 @@ randomx/
   排他授权正是其“响应保序”假设成立的前提）
 - 通道空闲时按 round-robin 选择请求方（上次被授权者优先级更低），避免饿死
 - W 通道跟随写地址 owner，保证 W 突发与被接受的 AW 属于同一主设备
+
+### `randomx_vm.v` — RandomX 虚拟机（**已实现**）
+- **程序缓冲区**：256 × 64-bit（`prog_wr_*` 端口预加载）；
+  指令编码 `[63:56]=opcode [55:52]=dst [51:48]=src [47:32]=mod [31:0]=imm32`，
+  `mod[1:0]=mod.mem`、`mod[3:2]=mod.shift`、`mod[7:4]=mod.cond`；
+  整数 opcode 编号与 `alu_int.v` 一致（0..18），浮点/控制为 19..29
+- **完整 29 条 ISA 译码**：整数 R/M 变体（IADD_RS/IADD_M/ISUB/IMUL/IMULH/
+  ISMULH/IMUL_RCP/INEG/IXOR/IROR/IROL/ISWAP）、CBRANCH、ISTORE、CFROUND、NOP、
+  浮点 FADD_R/M、FSUB_R/M、FSCAL_R、FMUL_R、FDIV_M、FSQRT_R、FSWAP_R
+- **内存地址生成**（规范 §5.5）：`src == dst` 时使用立即数寻址 + L3 掩码，
+  否则由 `mod.mem` 选择 L1/L2 掩码；ISTORE 由 `mod.cond ≥ 14` 选择 L3
+- **浮点执行**：每条浮点指令对寄存器对的低/高半部各发射一次（共享 `fpu_double`），
+  FSWAP_R 直接交换半部；CFROUND 按 `fprc = ror(r[src], imm32 % 64) & 3` 更新舍入模式
+- **程序配置**（规范 §4.6.4，由 `cfg_wr_*` 写入的 16 个 entropy 字派生）：
+  a 寄存器（`getSmallPositiveFloatBits`）、`ma`/`mx`、readReg0..3、
+  `datasetOffset = (entropy[13] % (DatasetExtraItems+1)) × 64`（64 周期取模）、
+  eMask0/1（`getFloatMask`）
+- **主循环**（规范 §4.6.2，`ITERATIONS` 次）：spAddr 混合 → Scratchpad 载入
+  （`r[i] ^= load64`，`f[i]`/`e[i]` 由两个 int32 转 double 并做指数/尾数掩码）→
+  执行 256 条指令 → `mx` 更新 → Dataset 取数并异或到 r → 交换 `ma`/`mx` →
+  回写 `r[i]` 与 `f[i] ^ e[i]` → spAddr 清零
+- **CBRANCH**：ST_COMPILE 预编译遍历按寄存器使用情况计算分支目标，跳转回 target+1
+- **最终哈希**：Scratchpad 以 512-bit 为单位 XOR 折叠（累加器以整数寄存器堆为初值）
+  后送入 AesHash1R
+- **参数**：`ITERATIONS`（默认 2048）、`SP_WORDS`（默认 262144）；
+  `randomx_top.v` 在 `-DSIMULATION` 下覆盖为 4 / 4096
+- 单元测试：`sim/tb_randomx_vm.v`（定向程序覆盖各指令类 + 主循环，逐寄存器自校验）
+- **TODO**：IMUL_RCP 依赖 `alu_int` 的倒数单元（仍为占位）；最终哈希为
+  Scratchpad XOR 折叠 + 单次 AesHash1R，尚未按规范逐 64 字节块压缩并做 Blake2b 收尾
 
 ### `alu_int.v` — 整数执行单元
 - 完整 RandomX 整数 ISA：IADD_RS, ISUB, IMUL, IMULH, ISMULH, INEG, IXOR, IROR/IROL, ISWAP, CBRANCH, ISTORE
@@ -508,6 +538,12 @@ iverilog -g2001 -DSIMULATION -o sim/tb_randomx_hbm_top.vvp \
     sim/tb_randomx_hbm_top.v
 vvp sim/tb_randomx_hbm_top.vvp   # 输出 ALL TESTS PASSED
 
+# RandomX VM 单元测试（定向程序覆盖各指令类 + 主循环）
+iverilog -g2001 -DSIMULATION -o sim/tb_randomx_vm.vvp \
+    rtl/aes_round.v rtl/aes_hash1r.v rtl/scratchpad_mem.v \
+    rtl/alu_int.v rtl/fpu_double.v rtl/randomx_vm.v sim/tb_randomx_vm.v
+vvp sim/tb_randomx_vm.vvp   # 输出 ALL CHECKS PASSED
+
 # SuperscalarHash 单元测试（全指令集，比对软件模型）
 iverilog -g2001 -o sim/tb_superscalar_hash.vvp \
     rtl/alu_int.v rtl/superscalar_hash.v sim/tb_superscalar_hash.v
@@ -535,6 +571,8 @@ done
 - 使用 `-DSIMULATION` 宏时：
   - Scratchpad 从 2 MiB 缩减为 32 KiB
   - Argon2d 从 262144 块缩减为 8 块（`randomx_top.v` 中的 parameter 覆盖）
+  - `randomx_vm` 的循环次数从 2048 降为 4、最终折叠的 Scratchpad 字数降为 4096
+    （同样由 `randomx_top.v` 的 parameter 覆盖）
 - `sim/tb_randomx_top.v` 内含行为级 HBM AXI4 从设备模型：Cache 窗口
   （`0x0_C000_0000` 起 8 KiB）由内存支持，因此 CACHE_INIT 阶段会真正把
   Argon2d 块写进 HBM 模型；窗口外（尚未生成的 Dataset）读回全 0
@@ -553,6 +591,7 @@ done
 | `sim/tb_superscalar_hash.v`| 全部 14 种 SuperscalarHash 指令，与软件模型逐寄存器比对   | PASS（269 周期）|
 | `sim/tb_fpu_double.v`      | FADD/FSUB/FMUL/FDIV/FSQRT/FSCAL/FSWAP，含 4 种舍入模式、NaN/Inf/±0、非规格化、上溢/下溢与 `busy` 握手 | PASS（47 项检查）|
 | `sim/tb_argon2_fill.v`     | Argon2d Cache 填充：与 Argon2 参考实现黄金向量逐块比对（m=8/t=3/43 字节 key，m=32/t=1/64 字节 key，m=6→8/t=5/100 字节 key） | PASS |
+| `sim/tb_randomx_vm.v`      | VM 定向程序：IADD_RS/ISUB/IXOR/IROR/ISWAP/IMUL/INEG/ISTORE/IADD_M/CBRANCH（含跳转）/FADD_R/FSCAL_R/FMUL_R/FSQRT_R/FSWAP_R/CFROUND，以及主循环的 Scratchpad 载入/回写 | PASS（`ALL CHECKS PASSED`）|
 | `sim/tb_randomx_top.v`     | 顶层集成冒烟测试：寄存器写种子 → start → 轮询 done → 读回哈希；含行为级 HBM 模型，检查 Cache 块确实写入 HBM | 运行完成（哈希值尚未自校验）|
 | `sim/tb_randomx_hbm_top.v` | 板级顶层：`hbm_init_done` 拉低期间无任何 AXI 地址握手、释放后正常完成、Argon2d 块经 33 位地址总线写入 Cache 窗口、`hbm_addr_err` 保持为 0 | PASS（`ALL TESTS PASSED`）|
 
@@ -561,7 +600,7 @@ done
 ### 验证方面的已知缺口
 - `tb_randomx_top.v` 尚非自校验：缺少与参考实现的期望哈希比对。
 - 尚无 testbench 覆盖：`aes_round` / `aes_gen1r` / `aes_gen4r` / `aes_hash1r`、
-  `alu_int`、`scratchpad_mem`、`randomx_vm`。
+  `alu_int`、`scratchpad_mem`。
 - 缺少与官方 [tevador/RandomX](https://github.com/tevador/RandomX) 参考实现的
   端到端测试向量对拍（黄金模型对比）。
 
@@ -584,7 +623,7 @@ done
 | alu_int.v        | 基本实现   | IMUL_RCP（可复用 superscalar_hash 的倒数单元）|
 | fpu_double.v     | **已实现** | 流水化以提升 Fmax（当前加/乘为单周期组合路径）|
 | superscalar_hash.v| **已实现** | 超标量调度（并行执行端口，性能优化）        |
-| randomx_vm.v     | 骨架       | 完整指令译码、内存地址计算、CFROUND         |
+| randomx_vm.v     | **已实现** | IMUL_RCP（依赖 `alu_int`）、最终哈希改为逐块 AesHash1R + Blake2b |
 | argon2_fill.v    | **已实现** | 无（cache 块经 cache_hbm_if 存入 HBM）      |
 
 ---
@@ -595,8 +634,12 @@ done
    cache 存储（HBM 或大容量 URAM）。~~ **已完成**：新增 `cache_hbm_if.v`
    （1 KiB 块 ↔ 32 拍 AXI4 突发）与 `axi_arbiter.v`（cache/dataset 共享
    HBM 端口），`randomx_top.v` 中的占位连接已去除。
-2. **`randomx_vm.v`** — 29 条 ISA 完整译码、CFROUND、L1/L2/L3 地址掩码、
-   浮点寄存器前递、Dataset 取数与 MX/MA 更新、程序结束的 Scratchpad XOR + AesHash1R。
+2. ~~**`randomx_vm.v`** — 29 条 ISA 完整译码、CFROUND、L1/L2/L3 地址掩码、
+   Dataset 取数与 MX/MA 更新、程序结束的 Scratchpad XOR + AesHash1R。~~
+   **已完成**：全部指令译码、程序配置（entropy）初始化、规范 §4.6.2 主循环、
+   Scratchpad 载入/回写与最终 XOR 折叠 + AesHash1R，新增 `sim/tb_randomx_vm.v`
+   自校验 testbench。**剩余**：IMUL_RCP 倒数单元、最终哈希逐块压缩 + Blake2b 收尾、
+   程序与 entropy 的加载通路（`randomx_top.v` 中仍为占位）。
 3. **`randomx_top.v`** — 打通 DS_GEN（SuperscalarHash 8 pass）与 FINAL_HASH，
    驱动 HBM 写通道。
 4. **AES 轮密钥** — `aes_gen1r` / `aes_gen4r` / `aes_hash1r` 中的常量目前为占位值，

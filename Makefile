@@ -45,11 +45,15 @@ SRCS_tb_cache_hbm_if    := $(RTL_DIR)/cache_hbm_if.v
 SRCS_tb_superscalar_hash:= $(RTL_DIR)/alu_int.v $(RTL_DIR)/superscalar_hash.v
 SRCS_tb_fpu_double      := $(RTL_DIR)/fpu_double.v
 SRCS_tb_argon2_fill     := $(RTL_DIR)/blake2b_core.v $(RTL_DIR)/argon2_fill.v
+SRCS_tb_randomx_vm      := $(RTL_DIR)/aes_round.v $(RTL_DIR)/aes_hash1r.v \
+                           $(RTL_DIR)/scratchpad_mem.v $(RTL_DIR)/alu_int.v \
+                           $(RTL_DIR)/fpu_double.v $(RTL_DIR)/randomx_vm.v
 SRCS_tb_randomx_top     := $(RTL_SRCS)
 SRCS_tb_randomx_hbm_top := $(RTL_SRCS) $(BOARD_SRCS)
 
 TESTS := tb_blake2b tb_hbm_dataset_if tb_cache_hbm_if tb_superscalar_hash \
-         tb_fpu_double tb_argon2_fill tb_randomx_top tb_randomx_hbm_top
+         tb_fpu_double tb_argon2_fill tb_randomx_vm tb_randomx_top \
+         tb_randomx_hbm_top
 
 .PHONY: all test lint syntax clean $(TESTS)
 
