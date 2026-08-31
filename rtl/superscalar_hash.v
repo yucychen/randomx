@@ -58,6 +58,11 @@ module superscalar_hash (
     input  wire [11:0]  prog_wr_addr,  // up to 4096 instructions
     input  wire [63:0]  prog_wr_data,  // encoded instruction word
 
+    // Program base address inside the program buffer (execution starts here).
+    // Allows several SuperscalarHash programs (e.g. the 8 programs used by
+    // dataset generation) to share one program buffer.
+    input  wire [11:0]  prog_base,
+
     // Program length (number of instructions to execute)
     input  wire [11:0]  prog_len,
 
@@ -208,7 +213,7 @@ localparam ST_WB    = 3'd5;
 localparam ST_DONE  = 3'd6;
 
 reg [2:0]  state;
-reg [11:0] pc;
+reg [11:0] pc;      // absolute index into prog_mem
 reg [2:0]  wb_dst;      // writeback destination register
 
 integer i;
@@ -249,7 +254,7 @@ always @(posedge clk or negedge rst_n) begin
                     rf[2] <= init_r2; rf[3] <= init_r3;
                     rf[4] <= init_r4; rf[5] <= init_r5;
                     rf[6] <= init_r6; rf[7] <= init_r7;
-                    pc    <= 12'd0;
+                    pc    <= prog_base;
                     busy  <= 1'b1;
                     state <= ST_FETCH;
                 end
@@ -257,7 +262,7 @@ always @(posedge clk or negedge rst_n) begin
 
             // -----------------------------------------------------------
             ST_FETCH: begin
-                if (pc >= prog_len) begin
+                if ({1'b0, pc} >= ({1'b0, prog_base} + {1'b0, prog_len})) begin
                     state <= ST_DONE;
                 end else begin
                     cur_instr <= prog_mem[pc];

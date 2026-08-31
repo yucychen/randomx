@@ -44,6 +44,7 @@ superscalar_hash dut (
     .prog_wr_en   (prog_wr_en),
     .prog_wr_addr (prog_wr_addr),
     .prog_wr_data (prog_wr_data),
+    .prog_base    (12'd0),
     .prog_len     (prog_len),
     .init_r0      (init_r[0]), .init_r1 (init_r[1]),
     .init_r2      (init_r[2]), .init_r3 (init_r[3]),
