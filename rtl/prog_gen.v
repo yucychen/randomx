@@ -15,9 +15,8 @@
 // can chain further programs (spec: the same generator continues across the
 // 8 programs of one hash).
 //
-// NOTE: the AES round keys of `aes_gen4r` are still placeholders (see the
-// README roadmap item "AES 轮密钥"), so the generated program is structurally
-// correct but not yet bit-compatible with the reference implementation.
+// NOTE: `aes_gen4r` now uses the round keys of the reference implementation,
+// so the generated program is bit-compatible with `fillAes4Rx4`.
 //
 // Verilog-2001 compliant.
 // =============================================================================
