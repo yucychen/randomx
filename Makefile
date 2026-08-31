@@ -42,6 +42,8 @@ BOARD_SRCS := $(RTL_DIR)/randomx_hbm_top.v
 
 # 每个 testbench 需要的 RTL 子集
 SRCS_tb_blake2b         := $(RTL_DIR)/blake2b_core.v
+SRCS_tb_aes             := $(RTL_DIR)/aes_round.v $(RTL_DIR)/aes_gen1r.v \
+                           $(RTL_DIR)/aes_gen4r.v $(RTL_DIR)/aes_hash1r.v
 SRCS_tb_hbm_dataset_if  := $(RTL_DIR)/hbm_dataset_if.v
 SRCS_tb_cache_hbm_if    := $(RTL_DIR)/cache_hbm_if.v
 SRCS_tb_superscalar_hash:= $(RTL_DIR)/alu_int.v $(RTL_DIR)/superscalar_hash.v
@@ -55,7 +57,7 @@ SRCS_tb_randomx_vm      := $(RTL_DIR)/aes_round.v $(RTL_DIR)/aes_hash1r.v \
 SRCS_tb_randomx_top     := $(RTL_SRCS)
 SRCS_tb_randomx_hbm_top := $(RTL_SRCS) $(BOARD_SRCS)
 
-TESTS := tb_blake2b tb_hbm_dataset_if tb_cache_hbm_if tb_superscalar_hash \
+TESTS := tb_blake2b tb_aes tb_hbm_dataset_if tb_cache_hbm_if tb_superscalar_hash \
          tb_fpu_double tb_argon2_fill tb_dataset_gen tb_randomx_vm \
          tb_randomx_top tb_randomx_hbm_top
 

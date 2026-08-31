@@ -550,8 +550,11 @@ aes_hash1r u_aes_hash (
     .clk      (clk),
     .rst_n    (rst_n),
     .start    (vm_aes_start),
+    .blk_valid(vm_aes_start),
+    .blk_last (1'b1),
     .data_in  (vm_aes_data_in),
     .hash_out (aes_hash_out),
+    .busy     (),
     .valid    (aes_hash_valid)
 );
 
