@@ -645,7 +645,7 @@ done
 | `sim/tb_blake2b.v`         | `"abc"`（外部 IV / `init` 两种）、空消息、200 字节两块链式哈希、`busy` 握手 | PASS（`ALL TESTS PASSED`）|
 | `sim/tb_hbm_dataset_if.v`  | 行为级 AXI4 从设备模型：多事务流水、背压、错误注入、AXI 属性与基址检查 | PASS |
 | `sim/tb_cache_hbm_if.v`    | 1 KiB 块 ↔ AXI4 突发：写/读回环、HBM 内字节序、随机背压、握手复用、SLVERR 粘滞位 | PASS（`ALL TESTS PASSED`）|
-| `sim/tb_superscalar_hash.v`| 全部 14 种 SuperscalarHash 指令，与软件模型逐寄存器比对   | PASS（269 周期）|
+| `sim/tb_superscalar_hash.v`| 全部 14 种 SuperscalarHash 指令（与软件模型逐寄存器比对），以及最后一个程序窗口（`prog_base`=3584、512 条指令）的取指终止边界 | PASS（269 周期）|
 | `sim/tb_fpu_double.v`      | FADD/FSUB/FMUL/FDIV/FSQRT/FSCAL/FSWAP，含 4 种舍入模式、NaN/Inf/±0、非规格化、上溢/下溢与 `busy` 握手 | PASS（47 项检查）|
 | `sim/tb_argon2_fill.v`     | Argon2d Cache 填充：与 Argon2 参考实现黄金向量逐块比对（m=8/t=3/43 字节 key，m=32/t=1/64 字节 key，m=6→8/t=5/100 字节 key） | PASS |
 | `sim/tb_dataset_gen.v`     | Dataset item 生成：寄存器种子、8 次 cache 访问与地址寄存器链、SuperscalarHash 程序执行、写端口背压，与黄金模型逐 item 比对 | PASS（`ALL TESTS PASSED`）|

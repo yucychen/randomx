@@ -23,6 +23,7 @@ reg         prog_wr_en = 1'b0;
 reg  [11:0] prog_wr_addr = 12'd0;
 reg  [63:0] prog_wr_data = 64'd0;
 reg  [11:0] prog_len = 12'd0;
+reg  [11:0] prog_base = 12'd0;
 reg  [63:0] init_r [0:7];
 wire [63:0] out_r0, out_r1, out_r2, out_r3, out_r4, out_r5, out_r6, out_r7;
 wire        busy, done;
@@ -44,7 +45,7 @@ superscalar_hash dut (
     .prog_wr_en   (prog_wr_en),
     .prog_wr_addr (prog_wr_addr),
     .prog_wr_data (prog_wr_data),
-    .prog_base    (12'd0),
+    .prog_base    (prog_base),
     .prog_len     (prog_len),
     .init_r0      (init_r[0]), .init_r1 (init_r[1]),
     .init_r2      (init_r[2]), .init_r3 (init_r[3]),
@@ -146,6 +147,38 @@ initial begin
         $display("PASS: SuperscalarHash program executed correctly (%0d cycles)", cycles);
     else
         $display("FAIL: %0d register mismatches", errors);
+
+    // -----------------------------------------------------------------------
+    // Boundary check: the last program window (base 3584) with the maximum
+    // program length (512) ends exactly at the top of the 4096-word program
+    // buffer, so the fetch loop must still terminate.
+    // -----------------------------------------------------------------------
+    prog_base = 12'd3584;
+    for (i = 0; i < 512; i = i + 1) begin
+        @(negedge clk);
+        prog_wr_en   = 1'b1;
+        prog_wr_addr = 12'd3584 + i[11:0];
+        prog_wr_data = 64'h0500000000000001; // IADD_C7  r0 += 1
+    end
+    @(negedge clk);
+    prog_wr_en = 1'b0;
+    prog_len   = 12'd512;
+
+    @(negedge clk);
+    start = 1'b1;
+    @(negedge clk);
+    start = 1'b0;
+
+    wait (done === 1'b1);
+    @(posedge clk);
+
+    if (out_r0 !== (init_r[0] + 64'd512)) begin
+        errors = errors + 1;
+        $display("FAIL: last program window: r0 = %016h expected %016h",
+                 out_r0, init_r[0] + 64'd512);
+    end else begin
+        $display("PASS: last program window (base 3584, len 512) terminated");
+    end
 
     $finish;
 end
