@@ -2,9 +2,16 @@
 # build.tcl — Vivado Project Build Script
 # RandomX FPGA Framework — Xilinx Virtex UltraScale+ XCVU33P
 #
-# Usage (Vivado Tcl console or batch mode):
-#   vivado -mode batch -source build.tcl
-#   OR open Vivado GUI → Tcl Console → source vivado/build.tcl
+# Usage:
+#   * OS shell (cmd/PowerShell/bash — NOT the Vivado Tcl console):
+#       vivado -mode batch -source vivado/build.tcl
+#       vivado -mode batch -source vivado/build.tcl -tclargs hbm
+#   * Vivado GUI → Tcl Console (Vivado is already running, so do not type the
+#     "vivado -mode batch ..." command there — it is a shell command, and the
+#     console answers with "Unknown Tcl command ... sending command to the OS
+#     shell for execution"):
+#       source E:/path/to/randomx/vivado/build.tcl            ;# vendor-neutral
+#       set hbm_enable 1; source E:/path/to/randomx/vivado/build.tcl  ;# HBM
 #
 # What this script does:
 #   1. Creates a new Vivado project for part xcvu33p-fsvh2104-2L-e
@@ -42,11 +49,17 @@ set part_name    "xcvu33p-fsvh2104-2L-e"
 #   0 — vendor-neutral build: top = randomx_top, the AXI4 master stays at the
 #       boundary (fast elaboration / synthesis checks, no IP, no licence).
 #   1 — board build: top = randomx_hbm_top, HBM IP + protocol converter are
-#       created and connected. Enable with: vivado -mode batch -source \
-#       vivado/build.tcl -tclargs hbm
+#       created and connected. Enable with either
+#         vivado -mode batch -source vivado/build.tcl -tclargs hbm   (OS shell)
+#       or, in the Vivado Tcl console,
+#         set hbm_enable 1; source .../vivado/build.tcl
 # ---------------------------------------------------------------------------
-set hbm_enable 0
-if {[llength $argv] > 0 && [lsearch -exact $argv "hbm"] >= 0} {
+if {![info exists hbm_enable]} {
+    set hbm_enable 0
+}
+# argv only exists in batch/tclargs mode; it is absent when sourcing from the
+# Vivado GUI Tcl console.
+if {[info exists argv] && [lsearch -exact $argv "hbm"] >= 0} {
     set hbm_enable 1
 }
 
@@ -97,6 +110,35 @@ set xdc_files [list \
     "${xdc_dir}/constraints.xdc"   \
 ]
 
+# Constraints that need Tcl control flow (they adapt to the build flavour) must
+# live in a .tcl script: Vivado reads .xdc files in constraint mode, where
+# 'if'/'foreach' raise "[Designutils 20-1307] Command 'if' is not supported in
+# the xdc constraint file" and the guarded constraints are silently dropped.
+set constr_tcl_files [list \
+    "${xdc_dir}/constraints.tcl"   \
+]
+
+# ---------------------------------------------------------------------------
+# Sets only the CONFIG.* parameters that the installed IP version actually
+# exposes. Parameters that do not exist are skipped with a warning instead of
+# aborting the build (Vivado applies -dict atomically, so a single unknown
+# parameter would otherwise discard the whole configuration).
+# ---------------------------------------------------------------------------
+proc apply_ip_config {ip cfg_dict} {
+    set supported [list_property $ip]
+    set applied   [list]
+    foreach {param value} $cfg_dict {
+        if {[lsearch -exact $supported $param] >= 0} {
+            lappend applied $param $value
+        } else {
+            puts "WARNING: parameter '$param' is not supported by this Vivado/IP version — skipped."
+        }
+    }
+    if {[llength $applied]} {
+        set_property -dict $applied $ip
+    }
+}
+
 # ---------------------------------------------------------------------------
 # Create project
 # ---------------------------------------------------------------------------
@@ -139,32 +181,59 @@ if {$hbm_enable} {
     # -- AXI4 (32-beat bursts from cache_hbm_if) -> AXI3 (16-beat maximum) --
     create_ip -name axi_protocol_converter -vendor xilinx.com -library ip \
               -module_name axi_protocol_converter_0
-    set_property -dict [list \
+    apply_ip_config [get_ips axi_protocol_converter_0] [list \
         CONFIG.ADDR_WIDTH        ${hbm_axi_addr_width} \
         CONFIG.DATA_WIDTH        256                   \
         CONFIG.ID_WIDTH          1                     \
         CONFIG.SI_PROTOCOL       AXI4                  \
         CONFIG.MI_PROTOCOL       AXI3                  \
         CONFIG.TRANSLATION_MODE  2                     \
-    ] [get_ips axi_protocol_converter_0]
+    ]
 
     # -- HBM controller --------------------------------------------------
     # Stack 0 only (XCVU33P has a single 4 GB HBM2 stack), one AXI port
     # enabled, internal switch ON so that the single port can reach the whole
     # stack (Global Addressing — see the header comment).
+    #
+    # NOTE: the exact set of USER_* parameters exposed by the HBM IP differs
+    # between Vivado releases (for example USER_HBM_REF_CLK_XTAL_0 only exists
+    # in some versions). Setting a parameter the installed IP does not know
+    # about aborts the whole -dict transaction with
+    #   [Vivado 12-4371] Cannot find parameter '...' on IP 'hbm_0'
+    # so every parameter is filtered against the IP's actual property list
+    # first and unknown ones are only reported as a warning.
     create_ip -name hbm -vendor xilinx.com -library ip -module_name hbm_0
-    set_property -dict [list \
+
+    set hbm_cfg [list \
         CONFIG.USER_HBM_DENSITY              4GB            \
         CONFIG.USER_HBM_STACK                1              \
-        CONFIG.USER_SAXI_00                  true           \
         CONFIG.USER_SWITCH_ENABLE_00         true           \
         CONFIG.USER_HBM_REF_CLK_0            100            \
         CONFIG.USER_HBM_REF_CLK_XTAL_0       100            \
         CONFIG.USER_APB_PCLK_0               100            \
         CONFIG.USER_HBM_FBDIV_0              12             \
-        CONFIG.USER_MC_ENABLE_00             true           \
         CONFIG.USER_AXI_CLK_FREQ             ${hbm_axi_clk_mhz} \
-    ] [get_ips hbm_0]
+    ]
+
+    # All eight memory controllers of stack 0 stay enabled: with Global
+    # Addressing the single AXI port must be able to reach every pseudo-channel
+    # of the 4 GB stack, which is only possible when no MC is switched off.
+    for {set mc 0} {$mc < 8} {incr mc} {
+        lappend hbm_cfg [format {CONFIG.USER_MC_ENABLE_%02d} $mc] true
+    }
+
+    # AXI slave ports. The HBM controller is hardened, so its wrapper exposes
+    # all 16 AXI slave ports of the stack regardless of this setting; keeping
+    # ports 00..15 enabled makes the black-box port list deterministic and
+    # matches the tie-offs in rtl/randomx_hbm_top.v (only AXI_00 carries
+    # traffic — the switch enabled above gives it access to the whole stack).
+    # Ports 16..31 belong to the second stack, which XCVU33P does not have.
+    for {set port 0} {$port < 32} {incr port} {
+        lappend hbm_cfg [format {CONFIG.USER_SAXI_%02d} $port] \
+                        [expr {$port < 16 ? "true" : "false"}]
+    }
+
+    apply_ip_config [get_ips hbm_0] $hbm_cfg
 
     # Generate the output products; without this the modules stay black boxes.
     foreach ip {axi_protocol_converter_0 hbm_0} {
@@ -197,6 +266,17 @@ set_property verilog_define {SIMULATION=1} [get_filesets sim_1]
 puts "INFO: Adding constraints..."
 add_files -fileset constrs_1 ${xdc_files}
 set_property target_constrs_file [lindex ${xdc_files} 0] [current_fileset -constrset]
+
+# Scripted constraints: added as TCL so that Vivado sources them as a full Tcl
+# script (control flow allowed) instead of parsing them in XDC mode.
+add_files -fileset constrs_1 ${constr_tcl_files}
+foreach ctcl ${constr_tcl_files} {
+    set cfile [get_files -of_objects [get_filesets constrs_1] $ctcl]
+    set_property file_type TCL $cfile
+    set_property USED_IN {synthesis implementation out_of_context} $cfile
+    # Run after the static XDC so GUI-written pin/IO constraints are in place.
+    set_property PROCESSING_ORDER LATE $cfile
+}
 
 # ---------------------------------------------------------------------------
 # Synthesis settings
