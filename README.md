@@ -628,31 +628,70 @@ done
 
 ---
 
-## 完善路线图（优先级从高到低）
+## 完善路线图
 
-1. ~~**Cache 存储** — 将 `argon2_fill.v` 的 1 KiB 块读写端口接到真实的
-   cache 存储（HBM 或大容量 URAM）。~~ **已完成**：新增 `cache_hbm_if.v`
-   （1 KiB 块 ↔ 32 拍 AXI4 突发）与 `axi_arbiter.v`（cache/dataset 共享
-   HBM 端口），`randomx_top.v` 中的占位连接已去除。
-2. ~~**`randomx_vm.v`** — 29 条 ISA 完整译码、CFROUND、L1/L2/L3 地址掩码、
-   Dataset 取数与 MX/MA 更新、程序结束的 Scratchpad XOR + AesHash1R。~~
-   **已完成**：全部指令译码、程序配置（entropy）初始化、规范 §4.6.2 主循环、
-   Scratchpad 载入/回写与最终 XOR 折叠 + AesHash1R，新增 `sim/tb_randomx_vm.v`
-   自校验 testbench。**剩余**：IMUL_RCP 倒数单元、最终哈希逐块压缩 + Blake2b 收尾、
-   程序与 entropy 的加载通路（`randomx_top.v` 中仍为占位）。
-3. **`randomx_top.v`** — 打通 DS_GEN（SuperscalarHash 8 pass）与 FINAL_HASH，
-   驱动 HBM 写通道。
-4. **AES 轮密钥** — `aes_gen1r` / `aes_gen4r` / `aes_hash1r` 中的常量目前为占位值，
-   需按 spec 3.3/3.4 从种子派生。
-5. **`alu_int.v` IMUL_RCP** — 2^128 / b 倒数计算。
-6. **验证** — 补齐单元 testbench，并与参考实现做端到端向量对拍。
-7. **后端** — ~~`build.tcl` 中实例化 Vivado HBM IP、HBM 参考时钟与跨时钟域约束~~
-   **已完成**：新增 `randomx_hbm_top.v`（复位门控 + 地址位宽适配 + 可选 IP 例化）、
-   `build.tcl` 的 `-tclargs hbm` 构建（HBM IP + AXI4→AXI3 协议转换器）、
-   `constraints.tcl` 填实 HBM 时钟/时钟分组并移除掩盖违例的 `m_axi_*` false path，
-   同时提供 SLR pblock 模板。
-   **剩余**：`PACKAGE_PIN` 占位符（依赖具体板卡）、pblock 的 CLOCKREGION 范围确认、
-   `fpu_double` 流水化以真正达成 300 MHz 时序收敛。
+### 当前进度概览
+
+| 阶段            | 状态 | 说明 |
+|-----------------|------|------|
+| Cache 初始化    | ✅   | `argon2_fill` + `cache_hbm_if` + `axi_arbiter`，与参考实现黄金向量对拍通过 |
+| Dataset 生成    | ⬜   | `superscalar_hash` 已实现，但 8 pass 调度与 HBM 写通道尚未接通 |
+| VM 执行         | 🟨   | 29 条 ISA、主循环、Scratchpad 读写已实现；程序/entropy 加载通路与 IMUL_RCP 待补 |
+| 最终哈希        | 🟨   | VM 内为 Scratchpad XOR 折叠 + AesHash1R；缺逐块压缩与 Blake2b 收尾 |
+| 板级/后端       | 🟨   | HBM IP、协议转换器、时钟与复位门控已就位；引脚约束与 300 MHz 收敛待办 |
+
+图例：✅ 已完成 ／ 🟨 部分完成 ／ ⬜ 未开始
+
+### 待办事项（优先级从高到低）
+
+1. **打通 `randomx_top.v` 数据通路**（当前最大缺口）
+   - `FSM_CACHE_INIT` 目前直接跳过 `FSM_DS_GEN`，需实现 SuperscalarHash 的
+     8 pass Dataset 生成，并驱动 `hbm_dataset_if` 的写通道
+     （`wr_req_valid` 现被硬接为 `1'b0`）。
+   - VM 的 `prog_wr_en` / `cfg_wr_en` 现为占位常量：需由 AesGenerator4R
+     产生程序字节与 entropy 并写入 VM。
+   - `FSM_FINAL_HASH` 目前直接透传 VM 输出：需接入 Blake2b 收尾。
+2. **AES 轮密钥**
+   - `aes_gen1r.v` / `aes_gen4r.v` / `aes_hash1r.v` 的轮密钥常量仍是占位值
+     （含全零 `RK3`），需按 spec §3.2/3.3/3.4 从种子派生。
+   - 这是 Dataset 生成与最终哈希正确性的前提，须先于端到端对拍完成。
+3. **最终哈希路径**
+   - 将 VM 的 Scratchpad XOR 折叠替换为规范要求的逐 64 字节块
+     AesHash1R 压缩，再接 Blake2b-256 输出 32 字节哈希。
+4. **`alu_int.v` 的 IMUL_RCP**
+   - 当前 `OP_IMUL_RCP` 直接返回 `src_a`（占位）。需实现 2^128 / b 的
+     倒数计算（长除法迭代或复用 `superscalar_hash` 的倒数单元），
+     `randomx_vm.v` 的 IMUL_RCP 依赖该结果。
+5. **验证补齐**
+   - 缺少 testbench 的模块：`aes_round` / `aes_gen1r` / `aes_gen4r` /
+     `aes_hash1r`、`alu_int`、`scratchpad_mem`。
+   - `sim/tb_randomx_top.v` 改为自校验：与 [tevador/RandomX](https://github.com/tevador/RandomX)
+     参考实现做端到端测试向量对拍。
+6. **时序与性能**
+   - `fpu_double` 流水化（加/乘目前是单周期组合路径），这是 300 MHz
+     收敛的主要障碍。
+   - `superscalar_hash` 的超标量并行执行端口（性能优化，非正确性阻塞项）。
+7. **板级收尾**
+   - `vivado/constraints.xdc` 中的 `PACKAGE_PIN` 占位符按具体板卡填实。
+   - pblock 的 `CLOCKREGION` 范围按实际 SLR 划分确认。
+8. **工程杂项**
+   - 仓库尚未包含 `LICENSE` 文件（建议与上游 RandomX 兼容的 BSD-3-Clause）。
+
+### 已完成（归档）
+
+- **Cache 存储通路** — `cache_hbm_if.v`（1 KiB 块 ↔ 32 拍 AXI4 突发）与
+  `axi_arbiter.v`（cache/dataset 共享 HBM 端口），`randomx_top.v` 中的
+  占位连接已去除。
+- **Argon2d Cache 填充** — `argon2_fill.v` 与 Argon2 参考实现黄金向量
+  逐块比对通过（`sim/tb_argon2_fill.v`）。
+- **`randomx_vm.v` 主体** — 全部指令译码、程序配置（entropy）初始化、
+  规范 §4.6.2 主循环、Scratchpad 载入/回写与最终 XOR 折叠 + AesHash1R，
+  配套自校验 testbench `sim/tb_randomx_vm.v`。
+- **Blake2b / FPU / SuperscalarHash** — 均已实现并有自校验 testbench。
+- **后端与板级顶层** — `randomx_hbm_top.v`（复位门控 + 34→33 位地址适配 +
+  可选 IP 例化）、`build.tcl` 的 `-tclargs hbm` 构建（HBM IP + AXI4→AXI3
+  协议转换器）、`constraints.tcl` 中填实的 HBM 时钟/时钟分组
+  （并移除了掩盖违例的 `m_axi_*` false path）以及 SLR pblock 模板。
 
 ---
 
