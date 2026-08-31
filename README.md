@@ -19,10 +19,10 @@ randomx/
 │   ├── randomx_top.v       # 顶层模块：时钟/复位、寄存器接口、主 FSM
 │   ├── blake2b_core.v      # Blake2b-512 压缩核（12 轮，4 路并行 G，24 周期/块）
 │   │                       #   含 blake2b_g 子模块（G 混合函数，纯组合）
-│   ├── aes_round.v         # AES 单轮函数（SubBytes/ShiftRows/MixColumns/ARK）
+│   ├── aes_round.v         # AES 单轮函数（AESENC / AESDEC）
 │   ├── aes_gen1r.v         # AesGenerator1R（1轮AES × 4 lane）
 │   ├── aes_gen4r.v         # AesGenerator4R（4轮AES × 4 lane）
-│   ├── aes_hash1r.v        # AesHash1R（4轮AES哈希 × 4 lane）
+│   ├── aes_hash1r.v        # AesHash1R（数据作轮密钥的流式吸收）
 │   ├── superscalar_hash.v  # SuperscalarHash（数据集生成程序执行单元）
 │   ├── dataset_gen.v       # Dataset item 生成器（8 次 cache 访问 + SuperscalarHash）
 │   ├── prog_gen.v          # VM 程序 / entropy 生成器（AesGenerator4R）
@@ -39,6 +39,7 @@ randomx/
 │   ├── tb_randomx_top.v    # 基础功能仿真 testbench
 │   ├── tb_randomx_hbm_top.v # 板级顶层 testbench（复位门控/地址适配自校验）
 │   ├── tb_blake2b.v        # Blake2b-512 参考测试向量 testbench（含多块/busy）
+│   ├── tb_aes.v            # AES 原语 testbench（黄金向量比对）
 │   ├── tb_hbm_dataset_if.v # HBM AXI4 接口 testbench（含 AXI 从设备模型）
 │   ├── tb_cache_hbm_if.v   # Cache 存储接口 testbench（含 AXI 从设备模型）
 │   ├── tb_argon2_fill.v    # Argon2d 填充 testbench（黄金向量比对）
@@ -188,19 +189,31 @@ randomx/
 - 已通过参考测试向量验证（`sim/tb_blake2b.v`）：
   `"abc"`（外部 IV / `init` 两种方式）、空消息、200 字节两块链式哈希、`busy` 握手
 
-### `aes_round.v` — AES 单轮函数
-- SubBytes：256 项 LUT S-box（纯组合逻辑）
-- ShiftRows：行移位（组合逻辑）
-- MixColumns：GF(2⁸) MDS 矩阵乘法（组合逻辑）
-- AddRoundKey：与轮密钥异或
-- `last_round` 控制是否跳过 MixColumns（最终轮）
+### `aes_round.v` — AES 单轮函数（**已实现**）
+- 实现 x86 AES-NI 的两个单轮原语（RandomX 即以此定义）：
+  - `dec = 0`（AESENC）：ShiftRows → SubBytes → MixColumns → AddRoundKey
+  - `dec = 1`（AESDEC）：InvShiftRows → InvSubBytes → InvMixColumns → AddRoundKey
+- SubBytes / InvSubBytes：两张 256 项 LUT S-box（纯组合逻辑）；
+  字节替换与行移位可交换，故两个方向都按 (Sub, Shift) 顺序实现
+- MixColumns / InvMixColumns：GF(2⁸) MDS 矩阵 `[2 3 1 1]` 与逆矩阵 `[14 11 13 9]`
+- `last_round` 控制是否跳过 (Inv)MixColumns
+- 已用 FIPS-197 AES-128 向量校验过的软件模型比对（`sim/tb_aes.v`）
 
-### `aes_gen1r.v` / `aes_gen4r.v` / `aes_hash1r.v`
-- 基于 `aes_round.v` 构建的 AES 生成器和哈希器
-- 4 × 128-bit lane 并行处理（64字节状态）
-- `aes_gen1r` 由顶层的 Scratchpad 填充阶段驱动，`aes_gen4r` 由 `prog_gen`
-  驱动，`aes_hash1r` 由 VM 的最终哈希步骤驱动
-- **TODO**：从种子派生正确的轮密钥（当前使用占位符常量）
+### `aes_gen1r.v` / `aes_gen4r.v` / `aes_hash1r.v`（**已实现**）
+- 基于 `aes_round.v` 构建的 AES 生成器和哈希器，4 × 128-bit lane 并行处理
+  （64 字节状态），轮密钥常量取自 RandomX 参考实现（`aes_hash.cpp`），
+  按 `{word3, word2, word1, word0}` 拼接以匹配 `_mm_set_epi32()` 的小端布局
+- `aes_gen1r`（spec §3.3，`fillAes1Rx4`）：每 64 字节输出一轮，
+  lane0/2 用 `aesdec`、lane1/3 用 `aesenc`，密钥为 `AES_GEN_1R_KEY0..3`；
+  输出即新状态，由顶层 Scratchpad 填充阶段回灌
+- `aes_gen4r`（spec §3.4，`fillAes4Rx4`）：每 64 字节四轮，
+  lane0/1 依次用 `key0..key3`、lane2/3 依次用 `key4..key7`，
+  同样是 lane0/2 解密、lane1/3 加密；由 `prog_gen` 驱动
+- `aes_hash1r`（spec §3.5，`hashAes1Rx4`）：状态初值为固定的
+  `AES_HASH_1R_STATE0..3`，**消息块本身作为轮密钥**被吸收
+  （lane0/2 加密、lane1/3 解密），最后再用 `xkey0` / `xkey1` 各跑一轮扩散；
+  握手为 `start`（重载初值）/ `blk_valid` / `blk_last` / `busy` / `valid`，
+  单块哈希即三者同拍拉高
 
 ### `scratchpad_mem.v` — Scratchpad 内存
 - 2 MiB（262144 × 64-bit），使用 `(* ram_style = "ultra" *)` 推断 URAM
@@ -564,6 +577,12 @@ vvp sim/tb_randomx_top.vvp
 iverilog -g2001 -o sim/tb_blake2b.vvp rtl/blake2b_core.v sim/tb_blake2b.v
 vvp sim/tb_blake2b.vvp   # 输出 ALL TESTS PASSED
 
+# AES 原语单元测试（与软件参考模型黄金向量比对）
+iverilog -g2001 -o sim/tb_aes.vvp \
+    rtl/aes_round.v rtl/aes_gen1r.v rtl/aes_gen4r.v rtl/aes_hash1r.v \
+    sim/tb_aes.v
+vvp sim/tb_aes.vvp   # 输出 ALL TESTS PASSED
+
 # HBM 数据集接口单元测试（AXI4 从设备模型 + 错误注入）
 iverilog -g2001 -o sim/tb_hbm_dataset_if.vvp \
     rtl/hbm_dataset_if.v sim/tb_hbm_dataset_if.v
@@ -642,6 +661,7 @@ done
 
 | Testbench                  | 覆盖范围                                                | 结果 |
 |----------------------------|---------------------------------------------------------|------|
+| `sim/tb_aes.v`             | AES 原语：AESENC/AESDEC（含 last round）、AesGenerator1R 连续 3 块、AesGenerator4R 连续 2 块、AesHash1R 单块与 3 块流式吸收，全部与软件参考模型黄金向量比对 | PASS（11 项检查）|
 | `sim/tb_blake2b.v`         | `"abc"`（外部 IV / `init` 两种）、空消息、200 字节两块链式哈希、`busy` 握手 | PASS（`ALL TESTS PASSED`）|
 | `sim/tb_hbm_dataset_if.v`  | 行为级 AXI4 从设备模型：多事务流水、背压、错误注入、AXI 属性与基址检查 | PASS |
 | `sim/tb_cache_hbm_if.v`    | 1 KiB 块 ↔ AXI4 突发：写/读回环、HBM 内字节序、随机背压、握手复用、SLVERR 粘滞位 | PASS（`ALL TESTS PASSED`）|
@@ -657,8 +677,7 @@ done
 
 ### 验证方面的已知缺口
 - `tb_randomx_top.v` 尚非自校验：缺少与参考实现的期望哈希比对。
-- 尚无 testbench 覆盖：`aes_round` / `aes_gen1r` / `aes_gen4r` / `aes_hash1r`、
-  `alu_int`、`scratchpad_mem`、`prog_gen`。
+- 尚无 testbench 覆盖：`alu_int`、`scratchpad_mem`、`prog_gen`。
 - 缺少与官方 [tevador/RandomX](https://github.com/tevador/RandomX) 参考实现的
   端到端测试向量对拍（黄金模型对比）。
 
@@ -671,9 +690,9 @@ done
 | randomx_top.v    | **已实现** | 完整 AXI-Lite 握手、8 程序链               |
 | randomx_hbm_top.v| **已实现** | 板级引脚约束（依赖具体板卡）                 |
 | blake2b_core.v   | **已实现** | 无（12 轮压缩、init/busy 接口，24 周期/块） |
-| aes_round.v      | **已实现** | 无（SubBytes/ShiftRows/MixColumns/ARK）    |
-| aes_gen1r/4r.v   | 骨架       | 从种子派生正确轮密钥                         |
-| aes_hash1r.v     | 骨架       | 从种子派生正确轮密钥                         |
+| aes_round.v      | **已实现** | 无（AESENC / AESDEC 两个方向）              |
+| aes_gen1r/4r.v   | **已实现** | 无（规范轮密钥 + enc/dec lane 映射）         |
+| aes_hash1r.v     | **已实现** | 无（流式吸收 + xkey0/xkey1 扩散轮）          |
 | scratchpad_mem.v | **已实现** | 无（URAM 推断、L1/L2/L3 掩码）             |
 | hbm_dataset_if.v | **已实现** | 无（写接口由 `dataset_gen` 驱动，HBM IP 已由 `randomx_hbm_top` 接通）|
 | cache_hbm_if.v   | **已实现** | 无（HBM IP 经 `randomx_hbm_top` + 协议转换器接通）|
@@ -684,7 +703,7 @@ done
 | randomx_vm.v     | **已实现** | IMUL_RCP（依赖 `alu_int`）、最终哈希改为逐块 AesHash1R + Blake2b |
 | argon2_fill.v    | **已实现** | 无（cache 块经 cache_hbm_if 存入 HBM）      |
 | dataset_gen.v    | **已实现** | SuperscalarHash 程序仍由主机加载（spec §6.1 生成器未实现）|
-| prog_gen.v       | **已实现** | 依赖 `aes_gen4r` 的正确轮密钥               |
+| prog_gen.v       | **已实现** | 无                                          |
 
 ---
 
@@ -696,8 +715,8 @@ done
 |-----------------|------|------|
 | Cache 初始化    | ✅   | `argon2_fill` + `cache_hbm_if` + `axi_arbiter`，与参考实现黄金向量对拍通过 |
 | Dataset 生成    | 🟨   | `dataset_gen` 完成 8 次 cache 访问 + SuperscalarHash 并写入 HBM；8 个超标量程序仍需主机加载 |
-| Scratchpad 填充 | 🟨   | 顶层 `SP_FILL` 阶段用 `aes_gen1r` 填满 Scratchpad；轮密钥仍为占位值 |
-| 程序/entropy 生成| 🟨   | `prog_gen` 用 `aes_gen4r` 生成 16 个 entropy 字 + 256 条指令；轮密钥仍为占位值 |
+| Scratchpad 填充 | ✅   | 顶层 `SP_FILL` 阶段用 `aes_gen1r` 填满 Scratchpad，轮密钥与 enc/dec 映射已与参考实现对拍 |
+| 程序/entropy 生成| ✅   | `prog_gen` 用 `aes_gen4r` 生成 16 个 entropy 字 + 256 条指令，轮密钥已对拍 |
 | VM 执行         | 🟨   | 29 条 ISA、主循环、Scratchpad 读写已实现；IMUL_RCP 与 8 程序链待补 |
 | 最终哈希        | 🟨   | VM 的 AesHash1R 结果已接 Blake2b-256 收尾；缺逐 64 字节块压缩 |
 | 板级/后端       | 🟨   | HBM IP、协议转换器、时钟与复位门控已就位；引脚约束与 300 MHz 收敛待办 |
@@ -706,41 +725,40 @@ done
 
 ### 待办事项（优先级从高到低）
 
-1. **AES 轮密钥**（当前最大缺口）
-   - `aes_gen1r.v` / `aes_gen4r.v` / `aes_hash1r.v` 的轮密钥常量仍是占位值
-     （含全零 `RK3`），需按 spec §3.2/3.3/3.4 从种子派生。
-   - 数据通路已打通，因此这是 Scratchpad 填充、程序生成与最终哈希
-     位级正确性的唯一前提，须先于端到端对拍完成。
-2. **SuperscalarHash 程序生成（spec §6.1）**
+1. **SuperscalarHash 程序生成（spec §6.1）**
    - `dataset_gen` 的 8 个程序目前经寄存器接口由主机写入
      （0x8C–0x98），片上 `generateSuperscalar` 未实现。
    - 若要完全脱离主机，需实现 Blake2bGenerator + 调度模型。
-3. **最终哈希路径**
+2. **最终哈希路径**
    - 顶层已用共享的 `blake2b_core` 对 VM 的 64 字节 AesHash1R 结果做
      Blake2b-256 收尾（`hash_out[255:0]`）；仍需把 VM 内的
      Scratchpad XOR 折叠替换为规范要求的逐 64 字节块 AesHash1R 压缩。
    - 8 程序链（RANDOMX_PROGRAM_COUNT = 8）尚未实现：目前每次哈希只跑一个程序。
-4. **`alu_int.v` 的 IMUL_RCP**
+3. **`alu_int.v` 的 IMUL_RCP**
    - 当前 `OP_IMUL_RCP` 直接返回 `src_a`（占位）。需实现 2^128 / b 的
      倒数计算（长除法迭代或复用 `superscalar_hash` 的倒数单元），
      `randomx_vm.v` 的 IMUL_RCP 依赖该结果。
-5. **验证补齐**
-   - 缺少 testbench 的模块：`aes_round` / `aes_gen1r` / `aes_gen4r` /
-     `aes_hash1r`、`alu_int`、`scratchpad_mem`、`prog_gen`。
+4. **验证补齐**
+   - 缺少 testbench 的模块：`alu_int`、`scratchpad_mem`、`prog_gen`。
    - `sim/tb_randomx_top.v` 改为自校验：与 [tevador/RandomX](https://github.com/tevador/RandomX)
      参考实现做端到端测试向量对拍。
-6. **时序与性能**
+5. **时序与性能**
    - `fpu_double` 流水化（加/乘目前是单周期组合路径），这是 300 MHz
      收敛的主要障碍。
    - `superscalar_hash` 的超标量并行执行端口（性能优化，非正确性阻塞项）。
-7. **板级收尾**
+6. **板级收尾**
    - `vivado/constraints.xdc` 中的 `PACKAGE_PIN` 占位符按具体板卡填实。
    - pblock 的 `CLOCKREGION` 范围按实际 SLR 划分确认。
-8. **工程杂项**
+7. **工程杂项**
    - 仓库尚未包含 `LICENSE` 文件（建议与上游 RandomX 兼容的 BSD-3-Clause）。
 
 ### 已完成（归档）
 
+- **AES 原语** — `aes_round.v` 补齐 AESDEC（逆 S-box / InvShiftRows /
+  InvMixColumns），`aes_gen1r` / `aes_gen4r` / `aes_hash1r` 换用 RandomX
+  参考实现的轮密钥常量与 enc/dec lane 映射，`aes_hash1r` 按 `hashAes1Rx4`
+  重写为「固定初值 + 消息作轮密钥吸收 + xkey0/xkey1 扩散」的流式结构；
+  配套黄金向量 testbench `sim/tb_aes.v`。
 - **顶层数据通路** — `randomx_top.v` 的主 FSM 打通
   CACHE_INIT → DS_GEN → SP_FILL → PROG_GEN → VM_RUN → FINAL_HASH：
   新增 `dataset_gen.v`（spec §7.3 的 Dataset item 生成，驱动
