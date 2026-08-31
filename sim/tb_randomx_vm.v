@@ -76,7 +76,10 @@ reg          ds_resp_valid;
 wire         ds_resp_ready;
 
 wire         aes_start;
+wire         aes_blk_valid;
+wire         aes_blk_last;
 wire [511:0] aes_data_in;
+wire [2047:0] regfile_out;
 wire [511:0] aes_hash_out;
 wire         aes_hash_valid;
 
@@ -118,8 +121,12 @@ randomx_vm #(
     .ds_resp_data  (ds_resp_data),
     .ds_resp_valid (ds_resp_valid),
     .ds_resp_ready (ds_resp_ready),
+    .do_final      (1'b1),
     .aes_start     (aes_start),
+    .aes_blk_valid (aes_blk_valid),
+    .aes_blk_last  (aes_blk_last),
     .aes_data_in   (aes_data_in),
+    .regfile_out   (regfile_out),
     .aes_hash_out  (aes_hash_out),
     .aes_hash_valid(aes_hash_valid),
     .hash_out      (hash_out),
@@ -144,8 +151,8 @@ aes_hash1r u_aes (
     .clk      (clk),
     .rst_n    (rst_n),
     .start    (aes_start),
-    .blk_valid(aes_start),
-    .blk_last (1'b1),
+    .blk_valid(aes_blk_valid),
+    .blk_last (aes_blk_last),
     .data_in  (aes_data_in),
     .hash_out (aes_hash_out),
     .busy     (),
@@ -221,6 +228,22 @@ endtask
 // ---------------------------------------------------------------------------
 // Test sequence
 // ---------------------------------------------------------------------------
+// The final AesHash1R pass overwrites the a registers, so latch their
+// entropy-derived initial values while the program is still running.
+reg [63:0] a0_lo_init, a0_hi_init;
+reg        a0_latched;
+always @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+        a0_latched <= 1'b0;
+        a0_lo_init <= 64'b0;
+        a0_hi_init <= 64'b0;
+    end else if (!a0_latched && u_dut.a_lo[0] !== 64'b0) begin
+        a0_lo_init <= u_dut.a_lo[0];
+        a0_hi_init <= u_dut.a_hi[0];
+        a0_latched <= 1'b1;
+    end
+end
+
 initial begin
     $dumpfile("tb_randomx_vm.vcd");
     $dumpvars(0, tb_randomx_vm);
@@ -314,8 +337,21 @@ initial begin
     check64("r6",    u_dut.r[6],    64'h0000000000010100);
     check64("r7",    u_dut.r[7],    64'h0000000000000100);
     // a0 = (4.0, 1.0) from the program entropy
-    check64("a0.lo", u_dut.a_lo[0], 64'h4010000000000000);
-    check64("a0.hi", u_dut.a_hi[0], 64'h3FF0000000000000);
+    check64("a0.lo init", a0_lo_init, 64'h4010000000000000);
+    check64("a0.hi init", a0_hi_init, 64'h3FF0000000000000);
+    // getFinalResult() overwrites the a registers with the 64-byte AesHash1R
+    // digest of the scratchpad, so a0..a3 must now mirror `hash_out`
+    // (their entropy-derived initial values are checked above).
+    check64("a0.lo = digest", u_dut.a_lo[0], hash_out[ 63:  0]);
+    check64("a0.hi = digest", u_dut.a_hi[0], hash_out[127: 64]);
+    check64("a3.hi = digest", u_dut.a_hi[3], hash_out[511:448]);
+    // regfile_out must expose the reference RegisterFile byte layout
+    check64("regfile r0",   regfile_out[  63:   0], u_dut.r[0]);
+    check64("regfile r7",   regfile_out[ 511: 448], u_dut.r[7]);
+    check64("regfile f0lo", regfile_out[ 575: 512], u_dut.f_lo[0]);
+    check64("regfile e0lo", regfile_out[1087:1024], u_dut.e_lo[0]);
+    check64("regfile a0lo", regfile_out[1599:1536], u_dut.a_lo[0]);
+    check64("regfile a3hi", regfile_out[2047:1984], u_dut.a_hi[3]);
     // f0 = a0 with FSCAL applied
     check64("f0.lo", u_dut.f_lo[0], 64'hC0E0000000000000);
     check64("f0.hi", u_dut.f_hi[0], 64'hBF00000000000000);

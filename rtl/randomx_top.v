@@ -96,8 +96,9 @@ localparam FSM_DS_GEN     = 4'd2;   // SuperscalarHash dataset generation
 localparam FSM_SP_FILL    = 4'd3;   // AesGenerator1R scratchpad fill
 localparam FSM_PROG_GEN   = 4'd4;   // AesGenerator4R program + entropy
 localparam FSM_VM_RUN     = 4'd5;   // RandomX VM execution
-localparam FSM_FINAL_HASH = 4'd6;   // Blake2b finalization
-localparam FSM_DONE       = 4'd7;
+localparam FSM_CHAIN_HASH = 4'd6;   // Blake2b-512(RegisterFile) -> next seed
+localparam FSM_FINAL_HASH = 4'd7;   // Blake2b-256(RegisterFile) -> result
+localparam FSM_DONE       = 4'd8;
 
 reg [3:0] fsm_state;
 
@@ -127,16 +128,30 @@ wire          a2_b2b_start, a2_b2b_init, a2_b2b_last;
 wire [1023:0] a2_b2b_msg;
 wire [127:0]  a2_b2b_byte_cnt;
 wire [511:0]  a2_b2b_h_in;
-// Final-hash side (driven by the top-level FSM)
+// Final/chain hash side (driven by the top-level FSM). Both hash the 256-byte
+// VM register file, which is exactly two 128-byte Blake2b blocks:
+//   chain seeds  : Blake2b-512(RegisterFile) -> 64-byte seed of the next program
+//   final result : Blake2b-256(RegisterFile) -> the RandomX hash
 reg           fh_b2b_start;
+reg           fh_blk;          // 0 = first 128-byte block, 1 = second
+reg  [511:0]  fh_chain;        // chaining value between the two blocks
 // Muxed core inputs — the two users are active in different FSM phases
-wire          b2b_final_sel = (fsm_state == FSM_FINAL_HASH);
-wire          b2b_start     = b2b_final_sel ? fh_b2b_start : a2_b2b_start;
-wire          b2b_init      = b2b_final_sel ? 1'b0         : a2_b2b_init;
-wire          b2b_last      = b2b_final_sel ? 1'b1         : a2_b2b_last;
-wire [1023:0] b2b_msg       = b2b_final_sel ? {512'b0, vm_hash_out} : a2_b2b_msg;
-wire [127:0]  b2b_byte_cnt  = b2b_final_sel ? 128'd64      : a2_b2b_byte_cnt;
-wire [511:0]  b2b_h_in      = b2b_final_sel ? B2B256_IV    : a2_b2b_h_in;
+wire          b2b_rf_sel    = (fsm_state == FSM_FINAL_HASH) ||
+                              (fsm_state == FSM_CHAIN_HASH);
+wire          b2b_start     = b2b_rf_sel ? fh_b2b_start : a2_b2b_start;
+wire          b2b_init      = b2b_rf_sel ? 1'b0         : a2_b2b_init;
+wire          b2b_last      = b2b_rf_sel ? fh_blk       : a2_b2b_last;
+wire [1023:0] b2b_msg       = b2b_rf_sel
+                                ? (fh_blk ? vm_regfile[2047:1024]
+                                          : vm_regfile[1023:   0])
+                                : a2_b2b_msg;
+wire [127:0]  b2b_byte_cnt  = b2b_rf_sel ? (fh_blk ? 128'd256 : 128'd128)
+                                         : a2_b2b_byte_cnt;
+wire [511:0]  b2b_h_in      = b2b_rf_sel
+                                ? (fh_blk ? fh_chain
+                                          : ((fsm_state == FSM_FINAL_HASH)
+                                               ? B2B256_IV : B2B512_IV))
+                                : a2_b2b_h_in;
 
 // --- Scratchpad memory (written by the AesGenerator1R fill, then by the VM) ---
 wire        sp_rd_en;
@@ -175,7 +190,12 @@ wire        vm_done;
 reg         vm_start;
 wire [511:0] vm_hash_out;
 wire        vm_aes_start;
+wire        vm_aes_blk_valid;
+wire        vm_aes_blk_last;
 wire [511:0] vm_aes_data_in;
+wire [2047:0] vm_regfile;
+reg  [2:0]  chain_cnt;      // current program index (0..PROG_LAST)
+reg  [511:0] pg_seed;       // seed of the current program
 
 // --- Program / entropy generator (AesGenerator4R) ---
 reg         pg_start;
@@ -215,6 +235,16 @@ localparam [511:0] B2B256_IV = {64'h5be0cd19137e2179, 64'h1f83d9abfb41bd6b,
                                 64'h9b05688c2b3e6c1f, 64'h510e527fade682d1,
                                 64'ha54ff53a5f1d36f1, 64'h3c6ef372fe94f82b,
                                 64'hbb67ae8584caa73b, B2B256_H0};
+
+// Blake2b-512 parameter-block IV (digest length 64), used for the chain seeds.
+localparam [63:0] B2B512_H0 = 64'h6a09e667f3bcc908 ^ 64'h0000000001010040;
+localparam [511:0] B2B512_IV = {64'h5be0cd19137e2179, 64'h1f83d9abfb41bd6b,
+                                64'h9b05688c2b3e6c1f, 64'h510e527fade682d1,
+                                64'ha54ff53a5f1d36f1, 64'h3c6ef372fe94f82b,
+                                64'hbb67ae8584caa73b, B2B512_H0};
+
+// RANDOMX_PROGRAM_COUNT: 8 chained programs per hash (spec §4.6)
+localparam [2:0] PROG_LAST = 3'd7;
 
 // Scratchpad size in 64-bit words (matches scratchpad_mem / randomx_vm)
 `ifdef SIMULATION
@@ -550,8 +580,8 @@ aes_hash1r u_aes_hash (
     .clk      (clk),
     .rst_n    (rst_n),
     .start    (vm_aes_start),
-    .blk_valid(vm_aes_start),
-    .blk_last (1'b1),
+    .blk_valid(vm_aes_blk_valid),
+    .blk_last (vm_aes_blk_last),
     .data_in  (vm_aes_data_in),
     .hash_out (aes_hash_out),
     .busy     (),
@@ -594,8 +624,12 @@ randomx_vm #(
     .ds_resp_data  (ds_resp_data),
     .ds_resp_valid (ds_resp_valid),
     .ds_resp_ready (ds_resp_ready),
+    .do_final      (chain_cnt == PROG_LAST),
     .aes_start     (vm_aes_start),
+    .aes_blk_valid (vm_aes_blk_valid),
+    .aes_blk_last  (vm_aes_blk_last),
     .aes_data_in   (vm_aes_data_in),
+    .regfile_out   (vm_regfile),
     .aes_hash_out  (aes_hash_out),
     .aes_hash_valid(aes_hash_valid),
     .hash_out      (vm_hash_out),
@@ -635,7 +669,7 @@ prog_gen u_prog_gen (
     .clk          (clk),
     .rst_n        (rst_n),
     .start        (pg_start),
-    .seed_in      (seed_reg),
+    .seed_in      (pg_seed),
     .prog_wr_en   (pg_prog_wr_en),
     .prog_wr_addr (pg_prog_wr_addr),
     .prog_wr_data (pg_prog_wr_data),
@@ -845,7 +879,7 @@ end
 // ===========================================================================
 // Top-level FSM
 // ===========================================================================
-assign all_done = vm_done;
+assign all_done = (fsm_state == FSM_DONE);
 
 always @(posedge clk or negedge rst_n) begin
     if (!rst_n) begin
@@ -857,6 +891,10 @@ always @(posedge clk or negedge rst_n) begin
         sp_fill_start<= 1'b0;
         pg_start     <= 1'b0;
         fh_b2b_start <= 1'b0;
+        fh_blk       <= 1'b0;
+        fh_chain     <= 512'b0;
+        chain_cnt    <= 3'd0;
+        pg_seed      <= 512'b0;
         hash_out     <= 512'b0;
     end else begin
         argon2_start  <= 1'b0;
@@ -871,6 +909,7 @@ always @(posedge clk or negedge rst_n) begin
                 if (start_pulse) begin
                     busy         <= 1'b1;
                     argon2_start <= 1'b1;
+                    chain_cnt    <= 3'd0;
                     fsm_state    <= FSM_CACHE_INIT;
                 end
             end
@@ -892,8 +931,11 @@ always @(posedge clk or negedge rst_n) begin
             end
 
             // Scratchpad fill (AesGenerator1R)
+            // Scratchpad fill (AesGenerator1R). fillAes1Rx4() writes its
+            // generator state back, so the post-fill state seeds program 0.
             FSM_SP_FILL: begin
                 if (sp_fill_done) begin
+                    pg_seed   <= sp_fill_state;
                     pg_start  <= 1'b1;
                     fsm_state <= FSM_PROG_GEN;
                 end
@@ -907,19 +949,49 @@ always @(posedge clk or negedge rst_n) begin
                 end
             end
 
+            // Program execution. Programs 0..6 are followed by a
+            // Blake2b-512 of the register file that seeds the next program;
+            // program 7 additionally runs getFinalResult() inside the VM and
+            // is followed by the Blake2b-256 that produces the hash.
             FSM_VM_RUN: begin
                 if (vm_done) begin
                     fh_b2b_start <= 1'b1;
-                    fsm_state    <= FSM_FINAL_HASH;
+                    fh_blk       <= 1'b0;
+                    fsm_state    <= (chain_cnt == PROG_LAST) ? FSM_FINAL_HASH
+                                                             : FSM_CHAIN_HASH;
                 end
             end
 
-            // Final hash: Blake2b-256 over the 64-byte AesHash1R result
-            // produced by the VM. hash_out[255:0] holds the RandomX result.
+            // Chain hash: Blake2b-512(RegisterFile) -> seed of the next
+            // program. The 256-byte register file is two Blake2b blocks.
+            FSM_CHAIN_HASH: begin
+                if (b2b_done) begin
+                    if (fh_blk) begin
+                        pg_seed   <= b2b_h_out;
+                        chain_cnt <= chain_cnt + 3'd1;
+                        pg_start  <= 1'b1;
+                        fsm_state <= FSM_PROG_GEN;
+                    end else begin
+                        fh_chain     <= b2b_h_out;
+                        fh_blk       <= 1'b1;
+                        fh_b2b_start <= 1'b1;
+                    end
+                end
+            end
+
+            // Final hash: Blake2b-256 over the 256-byte register file, whose
+            // a registers hold the AesHash1R digest of the scratchpad.
+            // hash_out[255:0] holds the RandomX result.
             FSM_FINAL_HASH: begin
                 if (b2b_done) begin
-                    hash_out  <= {256'b0, b2b_h_out[255:0]};
-                    fsm_state <= FSM_DONE;
+                    if (fh_blk) begin
+                        hash_out  <= {256'b0, b2b_h_out[255:0]};
+                        fsm_state <= FSM_DONE;
+                    end else begin
+                        fh_chain     <= b2b_h_out;
+                        fh_blk       <= 1'b1;
+                        fh_b2b_start <= 1'b1;
+                    end
                 end
             end
 

@@ -59,13 +59,11 @@
 // branch targets from register usage (spec §5.5.10); taken branches redirect
 // `ic` to target+1.
 //
-// Final step: the scratchpad is XOR-folded into a 512-bit accumulator (seeded
-// with the integer register file) and compressed with AesHash1R.
-//
-// Remaining deviations from the reference implementation (documented in the
-// README): IMUL_RCP relies on alu_int's reciprocal (still a placeholder), and
-// the final hash folds the scratchpad instead of streaming every 64-byte block
-// through AesHash1R followed by Blake2b finalisation.
+// Final step (only when `do_final` is set, i.e. the last program of the
+// 8-program chain): every 64-byte block of the scratchpad is streamed through
+// AesHash1R and the resulting 64-byte digest replaces the `a` registers, as in
+// getFinalResult() of the reference implementation. The caller then applies
+// Blake2b over the whole 256-byte register file exposed on `regfile_out`.
 //
 // Verilog-2001 compliant.
 // =============================================================================
@@ -115,13 +113,22 @@ module randomx_vm #(
     input  wire          ds_resp_valid,
     output reg           ds_resp_ready,
 
-    // AES hash output for final hash step
+    // Run the final AesHash1R pass over the scratchpad after this program
+    // (set for the last program of the chain only)
+    input  wire          do_final,
+
+    // AesHash1R streaming interface (spec §3.5)
     output reg           aes_start,
+    output reg           aes_blk_valid,
+    output reg           aes_blk_last,
     output reg  [511:0]  aes_data_in,
     input  wire [511:0]  aes_hash_out,
     input  wire          aes_hash_valid,
 
-    // Final 512-bit hash output
+    // Full 256-byte register file (r0..r7, f, e, a) in reference byte order
+    output wire [2047:0] regfile_out,
+
+    // Final 512-bit AesHash1R digest (valid when do_final was set)
     output reg  [511:0]  hash_out,
     output reg           done
 );
@@ -141,7 +148,7 @@ localparam [20:0] DS_EXTRA_MOD          = 21'd524289;
 
 // Last iteration index / last folded scratchpad word
 localparam [31:0] ITER_LAST = ITERATIONS - 1;
-localparam [31:0] FOLD_LAST = SP_WORDS - 1;
+localparam [31:0] FOLD_LAST = SP_WORDS - 1;   // last 64-bit word index
 
 // ---------------------------------------------------------------------------
 // VM opcode encoding (integer opcodes match alu_int.v)
@@ -214,6 +221,15 @@ reg [63:0]  e_lo [0:3];        // FP e registers low half
 reg [63:0]  e_hi [0:3];        // FP e registers high half
 reg [63:0]  a_lo [0:3];        // FP a registers low half (const)
 reg [63:0]  a_hi [0:3];        // FP a registers high half (const)
+
+// Reference RegisterFile layout (256 bytes): r[8], f[4][2], e[4][2], a[4][2].
+// Byte 0 of the struct maps to bit 0, so the concatenation runs high -> low.
+assign regfile_out = {
+    a_hi[3], a_lo[3], a_hi[2], a_lo[2], a_hi[1], a_lo[1], a_hi[0], a_lo[0],
+    e_hi[3], e_lo[3], e_hi[2], e_lo[2], e_hi[1], e_lo[1], e_hi[0], e_lo[0],
+    f_hi[3], f_lo[3], f_hi[2], f_lo[2], f_hi[1], f_lo[1], f_hi[0], f_lo[0],
+    r[7], r[6], r[5], r[4], r[3], r[2], r[1], r[0]
+};
 reg [63:0]  ma;                // Memory address register (dataset ptr)
 reg [63:0]  mx;                // Memory mix register
 reg [1:0]   fprc;              // FP rounding mode control
@@ -349,6 +365,7 @@ alu_int u_alu (
     .mem_is_l1    (mod_mem),
     .result       (alu_result),
     .result_valid (alu_valid),
+    .busy         (),
     .branch_taken (branch_taken),
     .mem_wr_en    (alu_mem_wr),
     .mem_wr_addr  (alu_mem_addr),
@@ -408,9 +425,9 @@ localparam ST_DS_REQ    = 5'd17;  // dataset item request
 localparam ST_DS_WAIT   = 5'd18;
 localparam ST_ST_R      = 5'd19;  // r registers → scratchpad
 localparam ST_ST_F      = 5'd20;  // f ^ e → scratchpad
-localparam ST_FIN_RD    = 5'd21;  // final scratchpad XOR fold
-localparam ST_FIN_W     = 5'd22;
-localparam ST_FIN_HASH  = 5'd23;
+localparam ST_FIN_RD    = 5'd21;  // final AesHash1R: scratchpad read
+localparam ST_FIN_W     = 5'd22;  // final AesHash1R: absorb 64-byte block
+localparam ST_FIN_HASH  = 5'd23;  // final AesHash1R: wait for the digest
 localparam ST_DONE      = 5'd24;
 
 reg [4:0] state;
@@ -494,6 +511,8 @@ always @(posedge clk or negedge rst_n) begin
         ds_req_idx   <= 32'b0;
         ds_resp_ready<= 1'b0;
         aes_start    <= 1'b0;
+        aes_blk_valid<= 1'b0;
+        aes_blk_last <= 1'b0;
         aes_data_in  <= 512'b0;
         hash_out     <= 512'b0;
         done         <= 1'b0;
@@ -531,8 +550,10 @@ always @(posedge clk or negedge rst_n) begin
     end else begin
         alu_en    <= 1'b0;
         fpu_en    <= 1'b0;
-        done      <= 1'b0;
-        aes_start <= 1'b0;
+        done          <= 1'b0;
+        aes_start     <= 1'b0;
+        aes_blk_valid <= 1'b0;
+        aes_blk_last  <= 1'b0;
         sp_rd_en  <= 1'b0;
         sp_wr_en  <= 1'b0;
 
@@ -991,9 +1012,8 @@ always @(posedge clk or negedge rst_n) begin
                     sp_addr0 <= 21'd0;
                     sp_addr1 <= 21'd0;
                     if (iter_cnt == ITER_LAST) begin
-                        for (i = 0; i < 8; i = i + 1) acc[i] <= r[i];
                         fold_cnt <= 32'd0;
-                        state    <= ST_FIN_RD;
+                        state    <= do_final ? ST_FIN_RD : ST_DONE;
                     end else begin
                         iter_cnt <= iter_cnt + 32'd1;
                         state    <= ST_LOOP;
@@ -1003,7 +1023,8 @@ always @(posedge clk or negedge rst_n) begin
                 end
             end
 
-            // ---- Final hash: XOR-fold the scratchpad, then AesHash1R ----
+            // ---- Final hash: stream every 64-byte scratchpad block
+            //      through AesHash1R (spec §3.5 / getFinalResult) ----
             ST_FIN_RD: begin
                 sp_rd_en    <= 1'b1;
                 sp_rd_addr  <= {fold_cnt[17:0], 3'd0};
@@ -1013,7 +1034,16 @@ always @(posedge clk or negedge rst_n) begin
 
             ST_FIN_W: begin
                 if (sp_rd_valid) begin
-                    acc[fold_cnt[2:0]] <= acc[fold_cnt[2:0]] ^ sp_rd_data;
+                    acc[fold_cnt[2:0]] <= sp_rd_data;
+                    if (fold_cnt[2:0] == 3'd7) begin
+                        // 8 words collected: absorb one 64-byte block. The
+                        // first block also (re)loads the fixed initial state.
+                        aes_start     <= (fold_cnt[31:3] == 29'd0);
+                        aes_blk_valid <= 1'b1;
+                        aes_blk_last  <= (fold_cnt == FOLD_LAST);
+                        aes_data_in   <= {sp_rd_data, acc[6], acc[5], acc[4],
+                                          acc[3], acc[2], acc[1], acc[0]};
+                    end
                     if (fold_cnt == FOLD_LAST) begin
                         state <= ST_FIN_HASH;
                     end else begin
@@ -1024,18 +1054,24 @@ always @(posedge clk or negedge rst_n) begin
             end
 
             ST_FIN_HASH: begin
-                aes_start   <= 1'b1;
-                aes_data_in <= {acc[7], acc[6], acc[5], acc[4],
-                                acc[3], acc[2], acc[1], acc[0]};
-                state       <= ST_DONE;
+                if (aes_hash_valid) begin
+                    hash_out <= aes_hash_out;
+                    // getFinalResult() writes the digest into the a registers
+                    a_lo[0] <= aes_hash_out[ 63:  0];
+                    a_hi[0] <= aes_hash_out[127: 64];
+                    a_lo[1] <= aes_hash_out[191:128];
+                    a_hi[1] <= aes_hash_out[255:192];
+                    a_lo[2] <= aes_hash_out[319:256];
+                    a_hi[2] <= aes_hash_out[383:320];
+                    a_lo[3] <= aes_hash_out[447:384];
+                    a_hi[3] <= aes_hash_out[511:448];
+                    state   <= ST_DONE;
+                end
             end
 
             ST_DONE: begin
-                if (aes_hash_valid) begin
-                    hash_out <= aes_hash_out;
-                    done     <= 1'b1;
-                    state    <= ST_IDLE;
-                end
+                done  <= 1'b1;
+                state <= ST_IDLE;
             end
 
             default: state <= ST_IDLE;

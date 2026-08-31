@@ -161,6 +161,7 @@ alu_int u_alu (
     .mem_is_l1    (1'b0),
     .result       (alu_result),
     .result_valid (alu_valid),
+    .busy         (),
     .branch_taken (),         // not used in SuperscalarHash
     .mem_wr_en    (),         // not used in SuperscalarHash
     .mem_wr_addr  (),
@@ -170,36 +171,22 @@ alu_int u_alu (
 
 // ---------------------------------------------------------------------------
 // IMUL_RCP reciprocal unit (RandomX spec §5.5.11 / reciprocal.c)
-//
-//   quotient  = 2^63 / divisor, remainder = 2^63 % divisor
-//   repeat bsr(divisor) times:  (bsr = number of significant bits)
-//       if (2*remainder >= divisor) { quotient = 2*quotient + 1;
-//                                     remainder = 2*remainder - divisor; }
-//       else                       { quotient = 2*quotient;
-//                                     remainder = 2*remainder; }
-//
-// Both loops are identical restoring-division steps, therefore the whole
-// computation is a single restoring division of 2^(63+bsr) by the divisor,
-// executed one bit per clock cycle.
+// Shared restoring-division unit, see rtl/recip.v.
 // ---------------------------------------------------------------------------
-reg  [63:0] rcp_divisor;   // zero-extended imm32 (never zero in valid programs)
-reg  [64:0] rcp_rem;
-reg  [63:0] rcp_quot;
-reg  [7:0]  rcp_cnt;       // remaining division steps
-reg         rcp_first;
+reg         rcp_start;
+reg  [63:0] rcp_divisor;
+wire [63:0] rcp_quot;
+wire        rcp_valid;
 
-// bsr: index of the highest set bit of the divisor + 1 (1..32)
-reg  [5:0]  rcp_bsr;
-integer     b;
-always @(*) begin
-    rcp_bsr = 6'd0;
-    for (b = 0; b < 32; b = b + 1)
-        if (rcp_divisor[b])
-            rcp_bsr = b[5:0] + 6'd1;
-end
-
-wire [64:0] rcp_rem_shift = {rcp_rem[63:0], 1'b0} | {64'b0, rcp_first};
-wire        rcp_ge        = (rcp_rem_shift >= {1'b0, rcp_divisor});
+recip u_recip (
+    .clk      (clk),
+    .rst_n    (rst_n),
+    .start    (rcp_start),
+    .divisor  (rcp_divisor),
+    .quotient (rcp_quot),
+    .valid    (rcp_valid),
+    .busy     ()
+);
 
 // ---------------------------------------------------------------------------
 // Control FSM
@@ -235,17 +222,15 @@ always @(posedge clk or negedge rst_n) begin
         alu_imm     <= 64'b0;
         wb_dst      <= 3'd0;
         rcp_divisor <= 64'b0;
-        rcp_rem     <= 65'b0;
-        rcp_quot    <= 64'b0;
-        rcp_cnt     <= 8'd0;
-        rcp_first   <= 1'b0;
+        rcp_start   <= 1'b0;
         for (i = 0; i < 8; i = i + 1)
             rf[i] <= 64'b0;
         out_r0 <= 64'b0; out_r1 <= 64'b0; out_r2 <= 64'b0; out_r3 <= 64'b0;
         out_r4 <= 64'b0; out_r5 <= 64'b0; out_r6 <= 64'b0; out_r7 <= 64'b0;
     end else begin
-        alu_en <= 1'b0;
-        done   <= 1'b0;
+        alu_en    <= 1'b0;
+        done      <= 1'b0;
+        rcp_start <= 1'b0;
 
         case (state)
             // -----------------------------------------------------------
@@ -326,9 +311,7 @@ always @(posedge clk or negedge rst_n) begin
                         // multiply by reciprocal(imm32) — compute it first
                         alu_opcode  <= ALU_IMUL_R;
                         rcp_divisor <= ss_imm_zx;
-                        rcp_rem     <= 65'b0;
-                        rcp_quot    <= 64'b0;
-                        rcp_first   <= 1'b1;
+                        rcp_start   <= 1'b1;
                         state       <= ST_RCP;
                     end
                     default: begin
@@ -339,32 +322,12 @@ always @(posedge clk or negedge rst_n) begin
             end
 
             // -----------------------------------------------------------
-            // Reciprocal computation: one restoring-division step per cycle
+            // Reciprocal computation (rtl/recip.v)
             // -----------------------------------------------------------
             ST_RCP: begin
-                if (rcp_first) begin
-                    // first cycle: bsr of the freshly loaded divisor is valid
-                    if (rcp_divisor == 64'b0) begin
-                        // division by zero cannot happen in valid programs
-                        alu_src_b <= 64'b0;
-                        state     <= ST_ISSUE;
-                    end else begin
-                        rcp_cnt   <= {2'b0, rcp_bsr} + 8'd63; // 64+bsr-1 more steps
-                        rcp_first <= 1'b0;
-                        rcp_rem   <= rcp_ge ? (rcp_rem_shift - {1'b0, rcp_divisor})
-                                            : rcp_rem_shift;
-                        rcp_quot  <= {rcp_quot[62:0], rcp_ge};
-                    end
-                end else begin
-                    rcp_rem  <= rcp_ge ? (rcp_rem_shift - {1'b0, rcp_divisor})
-                                       : rcp_rem_shift;
-                    rcp_quot <= {rcp_quot[62:0], rcp_ge};
-                    if (rcp_cnt == 8'd1) begin
-                        alu_src_b <= {rcp_quot[62:0], rcp_ge};
-                        state     <= ST_ISSUE;
-                    end else begin
-                        rcp_cnt <= rcp_cnt - 8'd1;
-                    end
+                if (rcp_valid) begin
+                    alu_src_b <= rcp_quot;
+                    state     <= ST_ISSUE;
                 end
             end
 

@@ -10,8 +10,10 @@
 //
 // All operations are 64-bit. Results feed back to the register file.
 //
-// TODO: IMUL_RCP (reciprocal multiply) requires a lookup table or division
-//       unit for the 64-bit modular inverse — currently stubbed.
+// All opcodes complete in one cycle except IMUL_RCP, which first runs the
+// shared restoring-division reciprocal unit (rtl/recip.v, 64 + bsr cycles)
+// and only then multiplies. Callers must wait for `result_valid` and must not
+// re-assert `en` while `busy` is high.
 //
 // Verilog-2001 compliant.
 // =============================================================================
@@ -41,6 +43,8 @@ module alu_int (
     // Result
     output reg  [63:0]  result,
     output reg          result_valid,
+    // High while a multi-cycle operation (IMUL_RCP) is in flight
+    output wire         busy,
 
     // CBRANCH: branch taken signal and target (PC update)
     output reg          branch_taken,
@@ -114,7 +118,31 @@ wire [63:0] cb_res   = src_a + cb_imm;
 wire        cb_taken = ((cb_res & (64'hFF << cb_shift)) == 64'b0);
 
 // ---------------------------------------------------------------------------
-// Combinational result MUX
+// IMUL_RCP: dst *= reciprocal(imm32) — the reciprocal takes 64 + bsr cycles,
+// so the operand is latched, the unit is started, and the multiply is issued
+// when the quotient arrives (RandomX spec §5.5.11).
+// ---------------------------------------------------------------------------
+reg         rcp_start;
+reg         rcp_pending;
+reg  [63:0] rcp_mul_a;
+reg  [63:0] rcp_div;
+wire [63:0] rcp_quot;
+wire        rcp_valid;
+
+recip u_recip (
+    .clk      (clk),
+    .rst_n    (rst_n),
+    .start    (rcp_start),
+    .divisor  (rcp_div),
+    .quotient (rcp_quot),
+    .valid    (rcp_valid),
+    .busy     ()
+);
+
+assign busy = rcp_pending;
+
+// ---------------------------------------------------------------------------
+// Result MUX
 // ---------------------------------------------------------------------------
 always @(posedge clk or negedge rst_n) begin
     if (!rst_n) begin
@@ -125,12 +153,23 @@ always @(posedge clk or negedge rst_n) begin
         mem_wr_addr  <= 64'b0;
         mem_wr_data  <= 64'b0;
         mem_wr_level <= 2'd2;
+        rcp_start    <= 1'b0;
+        rcp_pending  <= 1'b0;
+        rcp_mul_a    <= 64'b0;
+        rcp_div      <= 64'b0;
     end else begin
         result_valid <= 1'b0;
         branch_taken <= 1'b0;
         mem_wr_en    <= 1'b0;
+        rcp_start    <= 1'b0;
 
-        if (en) begin
+        if (rcp_pending) begin
+            if (rcp_valid) begin
+                result       <= rcp_mul_a * rcp_quot;
+                result_valid <= 1'b1;
+                rcp_pending  <= 1'b0;
+            end
+        end else if (en) begin
             result_valid <= 1'b1;
             case (opcode)
                 OP_IADD_RS: // dst = dst + (src << shift) + imm32
@@ -164,9 +203,12 @@ always @(posedge clk or negedge rst_n) begin
                     result <= ismulh_res;
 
                 OP_IMUL_RCP: begin
-                    // TODO: Compute 2^128 / src_b (64-bit reciprocal multiply)
-                    // Requires division unit or precomputed LUT — skeleton only
-                    result <= src_a; // placeholder
+                    // Multi-cycle: start the reciprocal, multiply later
+                    result_valid <= 1'b0;
+                    rcp_start    <= 1'b1;
+                    rcp_pending  <= 1'b1;
+                    rcp_mul_a    <= src_a;
+                    rcp_div      <= src_b;
                 end
 
                 OP_INEG_R:  // dst = -dst
