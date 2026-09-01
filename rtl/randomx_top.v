@@ -930,7 +930,6 @@ always @(posedge clk or negedge rst_n) begin
                 end
             end
 
-            // Scratchpad fill (AesGenerator1R)
             // Scratchpad fill (AesGenerator1R). fillAes1Rx4() writes its
             // generator state back, so the post-fill state seeds program 0.
             FSM_SP_FILL: begin
