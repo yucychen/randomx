@@ -2,12 +2,14 @@
 
 面向 Xilinx Virtex UltraScale+ **XCVU33P**（型号：`xcvu33p-fsvh2104-2L-e`）的 RandomX 工作量证明算法纯 Verilog-2001 硬件实现框架。
 
-> **状态：部分实现**  
-> 所有模块均可使用 `iverilog -g2001` 编译并通过仿真。
-> `blake2b_core` / `aes_round` / `scratchpad_mem` / `hbm_dataset_if` / `cache_hbm_if` /
-> `axi_arbiter` / `superscalar_hash` / `fpu_double` / `argon2_fill` / `randomx_vm`
-> 已完整实现并有单元测试覆盖（见 [单元测试状态](#单元测试状态)）；
-> 其余模块为骨架，功能逻辑以 `TODO` 注释标注，待完整实现。
+> **状态：算法路径已打通**  
+> 所有模块均可使用 `iverilog -g2001` 编译并通过仿真，`make test` 的 14 个
+> testbench 与 `make lint` 全部通过（见 [单元测试状态](#单元测试状态)）。
+> Cache 初始化 → Dataset 生成 → Scratchpad 填充 → 程序生成 → 8 程序链执行 →
+> 最终哈希的完整流程已在 RTL 中实现。
+> 仍未完成的算法环节只剩片上 `generateSuperscalar`（spec §6.1）：Dataset 生成
+> 用的 8 个超标量程序目前仍由主机经寄存器接口写入。
+> 完整 `calculate_hash` 的端到端黄金向量对拍亦待补（见 [完善路线图](#完善路线图)）。
 
 ---
 
@@ -27,7 +29,8 @@ randomx/
 │   ├── dataset_gen.v       # Dataset item 生成器（8 次 cache 访问 + SuperscalarHash）
 │   ├── prog_gen.v          # VM 程序 / entropy 生成器（AesGenerator4R）
 │   ├── randomx_vm.v        # RandomX 虚拟机（取指/译码/执行/回写）
-│   ├── alu_int.v           # 整数执行单元（19条整数指令）
+│   ├── alu_int.v           # 整数执行单元（19条整数指令，含 IMUL_RCP）
+│   ├── recip.v             # 共享倒数单元（IMUL_RCP，逐位恢复余数除法）
 │   ├── fpu_double.v        # 双精度浮点单元（IEEE 754 加/减/乘/除/开方 + FSCAL/FSWAP）
 │   ├── scratchpad_mem.v    # 2 MiB Scratchpad（URAM 推断，L1/L2/L3 掩码）
 │   ├── hbm_dataset_if.v    # HBM2 AXI4 主设备接口（数据集读写，流水化）
@@ -46,6 +49,9 @@ randomx/
 │   ├── tb_randomx_vm.v     # RandomX VM testbench（指令集/主循环自校验）
 │   ├── tb_fpu_double.v     # 双精度浮点单元 testbench
 │   ├── tb_superscalar_hash.v # SuperscalarHash 全指令集 testbench
+│   ├── tb_alu_int.v        # 整数执行单元 testbench（全 19 条 opcode）
+│   ├── tb_scratchpad_mem.v # Scratchpad testbench（读写回环 + L1/L2/L3 掩码）
+│   ├── tb_prog_gen.v       # 程序/entropy 生成器 testbench（黄金模型比对）
 │   └── tb_dataset_gen.v    # Dataset item 生成器 testbench（黄金模型比对）
 ├── vivado/
 │   ├── build.tcl           # Vivado TCL 构建脚本（含 HBM IP / 协议转换器创建）
@@ -73,8 +79,8 @@ randomx/
   (start/done/seed/hash)│  │SP_FILL   │   │ (Dataset生成) │    _hash      │
   SuperscalarHash 程序   │  │PROG_GEN  │   └──────────────┘               │
                         │  │VM_RUN    │   ┌──────────────┐               │
-                        │  │FINAL_HASH│──►│  prog_gen    │◄─►aes_gen4r   │
-                        │  │          │   │ (程序/entropy)│               │
+                        │  │CHAIN_HASH│──►│  prog_gen    │◄─►aes_gen4r   │
+                        │  │FINAL_HASH│   │ (程序/entropy)│               │
                         │  │          │   └───────┬──────┘               │
                         │  │          │   ┌───────▼──────┐                │
                         │  │          │──►│ randomx_vm   │                │
@@ -130,18 +136,19 @@ randomx/
     │
     ▼
 [3] RandomX VM 执行 (randomx_vm.v)
-    8 次迭代，每次：
+    8 个链式程序，每个程序 2048 次迭代，每次迭代：
       a) 获取 Dataset 条目 (hbm_dataset_if.v)
       b) 执行 256 条指令程序
-         - 整数指令 → alu_int.v
+         - 整数指令 → alu_int.v（IMUL_RCP → recip.v）
          - 浮点指令 → fpu_double.v
          - 内存访问 → scratchpad_mem.v
-      c) AES 混合 Scratchpad (aes_gen4r.v)
+      c) Scratchpad 载入 / 回写
+    程序之间：Blake2b-512(RegisterFile) → 下一个程序的种子 (prog_gen.v)
     │
     ▼
 [4] 最终哈希 (aes_hash1r.v + blake2b_core.v)
-    AesHash1R 压缩 Scratchpad → 512 bit
-    Blake2b 最终化 → 256 bit 输出哈希
+    AesHash1R 逐 64 字节块压缩整个 Scratchpad → 512 bit，写回 a 寄存器
+    Blake2b-256(RegisterFile, 256 字节) → 256 bit 输出哈希
 ```
 
 ---
@@ -164,9 +171,18 @@ randomx/
   | 0x98    | 写   | 程序配置：[2:0] 程序号、[15:4] 指令数、[18:16] 地址寄存器 |
 - **主 FSM**：IDLE → CACHE_INIT（Argon2d）→ DS_GEN（Dataset 生成）→
   SP_FILL（AesGenerator1R 填充 Scratchpad）→ PROG_GEN（AesGenerator4R
-  生成程序与 entropy）→ VM_RUN → FINAL_HASH（Blake2b-256）→ DONE
-- **最终哈希**：VM 的 AesHash1R 结果（64 字节）经共享的 `blake2b_core`
-  以 Blake2b-256 参数块压缩，结果放在 `hash_out[255:0]`
+  生成程序与 entropy）→ VM_RUN →〔CHAIN_HASH → PROG_GEN → VM_RUN〕×7 →
+  FINAL_HASH（Blake2b-256）→ DONE
+- **8 程序链**（RANDOMX_PROGRAM_COUNT = 8，规范 §4.6）：
+  `fillAes1Rx4` 会写回生成器状态，因此 Scratchpad 填充后的末态即为
+  程序 0 的种子；此后每个程序执行完毕，用 Blake2b-512(RegisterFile)
+  产生下一个程序的 64 字节种子（CHAIN_HASH 阶段）。
+  只有链上最后一个程序（`chain_cnt == 7`）会置起 VM 的 `do_final`，
+  触发 `getFinalResult` 的 Scratchpad AesHash1R 压缩
+- **最终哈希**：256 字节寄存器堆（`regfile_out`，其 a 寄存器已被
+  AesHash1R 摘要覆盖）经共享的 `blake2b_core` 以 Blake2b-256 参数块压缩，
+  结果放在 `hash_out[255:0]`。寄存器堆恰为两个 128 字节 Blake2b 块，
+  链哈希与最终哈希共用同一个两块时序器，仅参数块 IV 不同（512 位 / 256 位）
 - **HBM 地址映射**（34 位字节地址，8 GB HBM 堆栈）：
 
   | 区域    | 基址            | 大小      | 访问模块          |
@@ -177,7 +193,7 @@ randomx/
   两个主设备通过 `axi_arbiter.v` 共享同一个 AXI4 端口。
   Cache 读端口由 `argon2_fill`（CACHE_INIT 阶段）与 `dataset_gen`
   （DS_GEN 阶段）分时独占，两个阶段不重叠，因此只需一个归属多路选择器
-- **TODO**：完整 AXI-Lite 握手；8 程序链（RANDOMX_PROGRAM_COUNT）尚未实现
+- **TODO**：完整 AXI-Lite 握手（当前为简化的无握手寄存器接口）
 
 ### `blake2b_core.v` — Blake2b-512 压缩核（**已完成**）
 - `blake2b_g` 子模块：G 函数组合数据通路（rotr32/rotr24/rotr16/rotr63）
@@ -303,20 +319,36 @@ randomx/
   执行 256 条指令 → `mx` 更新 → Dataset 取数并异或到 r → 交换 `ma`/`mx` →
   回写 `r[i]` 与 `f[i] ^ e[i]` → spAddr 清零
 - **CBRANCH**：ST_COMPILE 预编译遍历按寄存器使用情况计算分支目标，跳转回 target+1
-- **最终哈希**：Scratchpad 以 512-bit 为单位 XOR 折叠（累加器以整数寄存器堆为初值）
-  后送入 AesHash1R
+- **最终哈希**（`getFinalResult`，仅当 `do_final` 为高，即链上最后一个程序）：
+  整个 Scratchpad 按 64 字节块依次流入 AesHash1R（`aes_blk_valid` /
+  `aes_blk_last` 握手），得到的 64 字节摘要写回 a 寄存器；
+  顶层再对 256 字节寄存器堆（`regfile_out`）做 Blake2b-256 收尾
+- **寄存器堆导出**：`regfile_out`（2048 位）按参考实现的 RegisterFile 字节布局
+  排列（r[8] / f[4][2] / e[4][2] / a[4][2]），供顶层做程序链哈希与最终哈希
 - **参数**：`ITERATIONS`（默认 2048）、`SP_WORDS`（默认 262144）；
   `randomx_top.v` 在 `-DSIMULATION` 下覆盖为 4 / 4096
-- 单元测试：`sim/tb_randomx_vm.v`（定向程序覆盖各指令类 + 主循环，逐寄存器自校验）
-- **TODO**：IMUL_RCP 依赖 `alu_int` 的倒数单元（仍为占位）；最终哈希为
-  Scratchpad XOR 折叠 + 单次 AesHash1R，尚未按规范逐 64 字节块压缩并做 Blake2b 收尾
+- 单元测试：`sim/tb_randomx_vm.v`（定向程序覆盖各指令类 + 主循环、最终
+  AesHash1R 摘要写回 a 寄存器、`regfile_out` 字节布局，逐寄存器自校验）
 
-### `alu_int.v` — 整数执行单元
-- 完整 RandomX 整数 ISA：IADD_RS, ISUB, IMUL, IMULH, ISMULH, INEG, IXOR, IROR/IROL, ISWAP, CBRANCH, ISTORE
+### `alu_int.v` — 整数执行单元（**已实现**）
+- 完整 RandomX 整数 ISA：IADD_RS, ISUB, IMUL, IMULH, ISMULH, IMUL_RCP, INEG,
+  IXOR, IROR/IROL, ISWAP, CBRANCH, ISTORE
 - 有符号/无符号 128-bit 乘法（高64位提取）
 - CBRANCH 条件掩码/分支判定（规范 5.5.10）；ISTORE L1/L2/L3 级别按 mod 字段解码
 - VM 侧：ST_COMPILE 预编译遍历按寄存器使用情况计算分支目标，跳转回 target+1
-- **TODO**：IMUL_RCP（模乘倒数）
+- IMUL_RCP 复用共享的 `recip.v`：先算出 `randomx_reciprocal(imm32)` 再做 64 位
+  乘法，因此该指令为多周期，执行期间 `busy` 为高，结果仍由 `result_valid` 指示
+  （调用方 `randomx_vm` / `superscalar_hash` 本就等待该脉冲，无需改动 FSM）
+- 单元测试：`sim/tb_alu_int.v`（全部 19 条 opcode + 7 组 IMUL_RCP 黄金向量）
+
+### `recip.v` — 共享倒数单元（**已实现**）
+- 实现规范 §5.5.11 / 参考实现 `reciprocal.c` 的 `randomx_reciprocal(divisor)`：
+  以逐位恢复余数除法计算 `2^(63+bsr) / divisor` 的低 64 位，
+  其中 `bsr` 为最高置位比特的位号 + 1，共 `64 + bsr` 个周期
+- `start` / `divisor` 发起，`valid` 脉冲输出 `quotient`，运算期间 `busy` 为高；
+  除数为 0 时返回 0
+- 由 `alu_int`（VM 的 IMUL_RCP）与 `superscalar_hash`（Dataset 生成的
+  IMUL_RCP）共享，两处不再各自实现除法
 
 ### `fpu_double.v` — 双精度浮点单元（**已实现**）
 - FADD_R/M、FSUB_R/M：IEEE 754 加减法（对阶 → 加减 → 规格化 → 舍入），单周期
@@ -339,8 +371,8 @@ randomx/
   IADD_C7/C8/C9、IXOR_C7/C8/C9、IMULH_R、ISMULH_R、IMUL_RCP
 - 顺序执行 FSM（取指→译码→发射→回写），每条指令写回后再取下一条，
   消除寄存器 RAW/WAW 冒险
-- IMUL_RCP 倒数单元：逐位恢复余数除法，计算 `floor(2^(63+bsr)/imm32)`
-  （与 `reciprocal.c` 位级一致），耗时 64+bsr(imm32) 周期
+- IMUL_RCP 复用共享的 `recip.v` 倒数单元（与 `reciprocal.c` 位级一致），
+  耗时 64+bsr(imm32) 周期
 - `prog_base` 输入指定程序在缓冲区中的起始地址，因此 Dataset 生成所需的
   8 个程序可共存于同一个 4096 字的程序缓冲（程序 i 占用第 i × 512 个字起的窗口）
 - 单元测试：`sim/tb_superscalar_hash.v`（覆盖全部 14 种指令，比对软件模型结果）
@@ -375,7 +407,8 @@ randomx/
   链式哈希，因此超过 80 字节的 key 也与参考实现一致；顶层由寄存器 0x88 指定
   实际字节数
 - 单元测试：`sim/tb_argon2_fill.v`，与 Argon2 参考实现生成的黄金向量逐块比对
-- **TODO**：接到真实 cache 存储（`randomx_top.v` 中的 cache 端口目前仍为占位）
+- Cache 读写端口已在 `randomx_top.v` 中接到 `cache_hbm_if`（1 KiB 块 ↔ AXI4
+  突发），并经 `axi_arbiter` 与 `hbm_dataset_if` 共享 HBM 端口
 
 ---
 
@@ -516,7 +549,8 @@ wait_on_run impl_1
 | **最高** | `fpu_double.v` 的 FADD/FMUL 单周期组合路径 | 拆成 2~3 级流水（`tb_fpu_double.v` 的 47 项检查必须仍通过） |
 | 高 | `argon2_fill.v` 的 BlaMka 乘加链（32×32 乘 → 64 位加 → 旋转 → 再乘加） | 确认乘法推断成 DSP58；必要时在 `gb` 内插流水（Cache 初始化只做一次，不影响稳态性能） |
 | 中 | `axi_arbiter.v` 的纯组合路由 | 若 timing report 指向仲裁器，在其输出侧插一级 AXI Register Slice |
-| 待评估 | `randomx_vm.v` ↔ `scratchpad_mem` 地址路径 | VM 补全后再评估；注意 URAM 输出寄存器级 |
+| 待评估 | `randomx_vm.v` ↔ `scratchpad_mem` 地址路径 | 注意 URAM 输出寄存器级；VM 已补全，可在综合后评估 |
+| 待评估 | `recip.v` 的逐位除法比较/减法链 | 单比特步进，逻辑级数低；若成为瓶颈可拆成两拍 |
 
 收敛顺序：先 `make test` / `make lint` 回归 → 综合看
 `report_design_analysis -logic_level_distribution` → 逻辑级数超标的先改 RTL →
@@ -566,7 +600,7 @@ iverilog -g2001 -DSIMULATION \
     rtl/aes_round.v rtl/aes_gen1r.v rtl/aes_gen4r.v rtl/aes_hash1r.v \
     rtl/blake2b_core.v rtl/scratchpad_mem.v rtl/hbm_dataset_if.v \
     rtl/cache_hbm_if.v rtl/axi_arbiter.v \
-    rtl/alu_int.v rtl/fpu_double.v rtl/superscalar_hash.v \
+    rtl/recip.v rtl/alu_int.v rtl/fpu_double.v rtl/superscalar_hash.v \
     rtl/dataset_gen.v rtl/prog_gen.v \
     rtl/argon2_fill.v rtl/randomx_vm.v rtl/randomx_top.v \
     sim/tb_randomx_top.v
@@ -603,7 +637,7 @@ iverilog -g2001 -DSIMULATION -o sim/tb_randomx_hbm_top.vvp \
     rtl/aes_round.v rtl/aes_gen1r.v rtl/aes_gen4r.v rtl/aes_hash1r.v \
     rtl/blake2b_core.v rtl/scratchpad_mem.v rtl/hbm_dataset_if.v \
     rtl/cache_hbm_if.v rtl/axi_arbiter.v \
-    rtl/alu_int.v rtl/fpu_double.v rtl/superscalar_hash.v \
+    rtl/recip.v rtl/alu_int.v rtl/fpu_double.v rtl/superscalar_hash.v \
     rtl/dataset_gen.v rtl/prog_gen.v \
     rtl/argon2_fill.v rtl/randomx_vm.v rtl/randomx_top.v rtl/randomx_hbm_top.v \
     sim/tb_randomx_hbm_top.v
@@ -611,19 +645,36 @@ vvp sim/tb_randomx_hbm_top.vvp   # 输出 ALL TESTS PASSED
 
 # Dataset item 生成单元测试（与黄金模型逐 item 比对）
 iverilog -g2001 -DSIMULATION -o sim/tb_dataset_gen.vvp \
-    rtl/alu_int.v rtl/superscalar_hash.v rtl/dataset_gen.v sim/tb_dataset_gen.v
+    rtl/recip.v rtl/alu_int.v rtl/superscalar_hash.v rtl/dataset_gen.v \
+    sim/tb_dataset_gen.v
 vvp sim/tb_dataset_gen.vvp   # 输出 ALL TESTS PASSED
 
 # RandomX VM 单元测试（定向程序覆盖各指令类 + 主循环）
 iverilog -g2001 -DSIMULATION -o sim/tb_randomx_vm.vvp \
     rtl/aes_round.v rtl/aes_hash1r.v rtl/scratchpad_mem.v \
-    rtl/alu_int.v rtl/fpu_double.v rtl/randomx_vm.v sim/tb_randomx_vm.v
+    rtl/recip.v rtl/alu_int.v rtl/fpu_double.v rtl/randomx_vm.v \
+    sim/tb_randomx_vm.v
 vvp sim/tb_randomx_vm.vvp   # 输出 ALL CHECKS PASSED
 
 # SuperscalarHash 单元测试（全指令集，比对软件模型）
 iverilog -g2001 -o sim/tb_superscalar_hash.vvp \
-    rtl/alu_int.v rtl/superscalar_hash.v sim/tb_superscalar_hash.v
+    rtl/recip.v rtl/alu_int.v rtl/superscalar_hash.v sim/tb_superscalar_hash.v
 vvp sim/tb_superscalar_hash.vvp   # 输出 PASS
+
+# 整数执行单元单元测试（全部 19 条 opcode + IMUL_RCP 黄金向量）
+iverilog -g2001 -o sim/tb_alu_int.vvp \
+    rtl/recip.v rtl/alu_int.v sim/tb_alu_int.v
+vvp sim/tb_alu_int.vvp   # 输出 ALL TESTS PASSED
+
+# Scratchpad 单元测试（读写回环 + L1/L2/L3 掩码别名）
+iverilog -g2001 -DSIMULATION -o sim/tb_scratchpad_mem.vvp \
+    rtl/scratchpad_mem.v sim/tb_scratchpad_mem.v
+vvp sim/tb_scratchpad_mem.vvp   # 输出 ALL TESTS PASSED
+
+# 程序/entropy 生成单元测试（与独立的 aes_gen4r 黄金模型比对）
+iverilog -g2001 -DSIMULATION -o sim/tb_prog_gen.vvp \
+    rtl/aes_round.v rtl/aes_gen4r.v rtl/prog_gen.v sim/tb_prog_gen.v
+vvp sim/tb_prog_gen.vvp   # 输出 ALL TESTS PASSED
 
 # 查看波形（需安装 GTKWave）
 gtkwave tb_randomx_top.vcd
@@ -665,11 +716,14 @@ done
 | `sim/tb_blake2b.v`         | `"abc"`（外部 IV / `init` 两种）、空消息、200 字节两块链式哈希、`busy` 握手 | PASS（`ALL TESTS PASSED`）|
 | `sim/tb_hbm_dataset_if.v`  | 行为级 AXI4 从设备模型：多事务流水、背压、错误注入、AXI 属性与基址检查 | PASS |
 | `sim/tb_cache_hbm_if.v`    | 1 KiB 块 ↔ AXI4 突发：写/读回环、HBM 内字节序、随机背压、握手复用、SLVERR 粘滞位 | PASS（`ALL TESTS PASSED`）|
+| `sim/tb_alu_int.v`         | 全部 19 条整数 opcode（含进位/借位、128 位有符号/无符号高位乘、移位与循环移位边界、ISTORE 的 L1/L2/L3 级别），以及 7 组 IMUL_RCP 黄金向量（含 2 的幂返回 0 的边界） | PASS（`ALL TESTS PASSED`）|
+| `sim/tb_scratchpad_mem.v`  | 读写回环与 `rd_valid` 时序、字节地址→字索引截断、覆写、L1/L2/L3 掩码别名（0x4000 在 L1 下别名到 0x0000，在 L3 下互不干扰）、16 字顺序填充回读 | PASS（`ALL TESTS PASSED`）|
+| `sim/tb_prog_gen.v`        | 与独立的 aes_gen4r 黄金模型比对 34 个块：16 个 cfg entropy 字与 256 条指令字的地址顺序与内容、`state_out` 链式末态、`busy`/`done` 握手 | PASS（`ALL TESTS PASSED`）|
 | `sim/tb_superscalar_hash.v`| 全部 14 种 SuperscalarHash 指令（与软件模型逐寄存器比对），以及最后一个程序窗口（`prog_base`=3584、512 条指令）的取指终止边界 | PASS（269 周期）|
 | `sim/tb_fpu_double.v`      | FADD/FSUB/FMUL/FDIV/FSQRT/FSCAL/FSWAP，含 4 种舍入模式、NaN/Inf/±0、非规格化、上溢/下溢与 `busy` 握手 | PASS（47 项检查）|
 | `sim/tb_argon2_fill.v`     | Argon2d Cache 填充：与 Argon2 参考实现黄金向量逐块比对（m=8/t=3/43 字节 key，m=32/t=1/64 字节 key，m=6→8/t=5/100 字节 key） | PASS |
 | `sim/tb_dataset_gen.v`     | Dataset item 生成：寄存器种子、8 次 cache 访问与地址寄存器链、SuperscalarHash 程序执行、写端口背压，与黄金模型逐 item 比对 | PASS（`ALL TESTS PASSED`）|
-| `sim/tb_randomx_vm.v`      | VM 定向程序：IADD_RS/ISUB/IXOR/IROR/ISWAP/IMUL/INEG/ISTORE/IADD_M/CBRANCH（含跳转）/FADD_R/FSCAL_R/FMUL_R/FSQRT_R/FSWAP_R/CFROUND，以及主循环的 Scratchpad 载入/回写 | PASS（`ALL CHECKS PASSED`）|
+| `sim/tb_randomx_vm.v`      | VM 定向程序：IADD_RS/ISUB/IXOR/IROR/ISWAP/IMUL/INEG/ISTORE/IADD_M/CBRANCH（含跳转）/FADD_R/FSCAL_R/FMUL_R/FSQRT_R/FSWAP_R/CFROUND，主循环的 Scratchpad 载入/回写，以及 `getFinalResult` 把 AesHash1R 摘要写回 a 寄存器与 `regfile_out` 的字节布局 | PASS（`ALL CHECKS PASSED`）|
 | `sim/tb_randomx_top.v`     | 顶层集成冒烟测试：寄存器写种子 → start → 轮询 done → 读回哈希；含行为级 HBM 模型，检查 Cache 块确实写入 HBM | 运行完成（哈希值尚未自校验）|
 | `sim/tb_randomx_hbm_top.v` | 板级顶层：`hbm_init_done` 拉低期间无任何 AXI 地址握手、释放后正常完成、Argon2d 块经 33 位地址总线写入 Cache 窗口、`hbm_addr_err` 保持为 0 | PASS（`ALL TESTS PASSED`）|
 
@@ -677,9 +731,9 @@ done
 
 ### 验证方面的已知缺口
 - `tb_randomx_top.v` 尚非自校验：缺少与参考实现的期望哈希比对。
-- 尚无 testbench 覆盖：`alu_int`、`scratchpad_mem`、`prog_gen`。
 - 缺少与官方 [tevador/RandomX](https://github.com/tevador/RandomX) 参考实现的
-  端到端测试向量对拍（黄金模型对比）。
+  端到端测试向量对拍（黄金模型对比）。这是目前唯一还没有黄金向量背书的环节：
+  各子模块均已单独对拍，但完整 `calculate_hash` 结果尚未逐位验证。
 
 ---
 
@@ -687,7 +741,7 @@ done
 
 | 模块              | 状态       | 主要 TODO                                  |
 |------------------|------------|-------------------------------------------|
-| randomx_top.v    | **已实现** | 完整 AXI-Lite 握手、8 程序链               |
+| randomx_top.v    | **已实现** | 完整 AXI-Lite 握手（8 程序链已实现）        |
 | randomx_hbm_top.v| **已实现** | 板级引脚约束（依赖具体板卡）                 |
 | blake2b_core.v   | **已实现** | 无（12 轮压缩、init/busy 接口，24 周期/块） |
 | aes_round.v      | **已实现** | 无（AESENC / AESDEC 两个方向）              |
@@ -697,10 +751,11 @@ done
 | hbm_dataset_if.v | **已实现** | 无（写接口由 `dataset_gen` 驱动，HBM IP 已由 `randomx_hbm_top` 接通）|
 | cache_hbm_if.v   | **已实现** | 无（HBM IP 经 `randomx_hbm_top` + 协议转换器接通）|
 | axi_arbiter.v    | **已实现** | 无（读/写通路独立 round-robin 仲裁）         |
-| alu_int.v        | 基本实现   | IMUL_RCP（可复用 superscalar_hash 的倒数单元）|
+| alu_int.v        | **已实现** | 无（19 条整数指令，IMUL_RCP 复用 `recip.v`）|
+| recip.v          | **已实现** | 无（共享倒数单元，与 `reciprocal.c` 位级一致）|
 | fpu_double.v     | **已实现** | 流水化以提升 Fmax（当前加/乘为单周期组合路径）|
 | superscalar_hash.v| **已实现** | 超标量调度（并行执行端口，性能优化）        |
-| randomx_vm.v     | **已实现** | IMUL_RCP（依赖 `alu_int`）、最终哈希改为逐块 AesHash1R + Blake2b |
+| randomx_vm.v     | **已实现** | 无（29 条 ISA、主循环、逐 64 字节块 AesHash1R 最终哈希）|
 | argon2_fill.v    | **已实现** | 无（cache 块经 cache_hbm_if 存入 HBM）      |
 | dataset_gen.v    | **已实现** | SuperscalarHash 程序仍由主机加载（spec §6.1 生成器未实现）|
 | prog_gen.v       | **已实现** | 无                                          |
@@ -717,9 +772,10 @@ done
 | Dataset 生成    | 🟨   | `dataset_gen` 完成 8 次 cache 访问 + SuperscalarHash 并写入 HBM；8 个超标量程序仍需主机加载 |
 | Scratchpad 填充 | ✅   | 顶层 `SP_FILL` 阶段用 `aes_gen1r` 填满 Scratchpad，轮密钥与 enc/dec 映射已与参考实现对拍 |
 | 程序/entropy 生成| ✅   | `prog_gen` 用 `aes_gen4r` 生成 16 个 entropy 字 + 256 条指令，轮密钥已对拍 |
-| VM 执行         | 🟨   | 29 条 ISA、主循环、Scratchpad 读写已实现；IMUL_RCP 与 8 程序链待补 |
-| 最终哈希        | 🟨   | VM 的 AesHash1R 结果已接 Blake2b-256 收尾；缺逐 64 字节块压缩 |
+| VM 执行         | ✅   | 29 条 ISA（含 IMUL_RCP）、主循环、Scratchpad 读写，以及 8 程序链（Blake2b-512(RegisterFile) 播种下一程序）|
+| 最终哈希        | ✅   | 整个 Scratchpad 逐 64 字节块经 AesHash1R 压缩写回 a 寄存器，再对 256 字节寄存器堆做 Blake2b-256 收尾 |
 | 板级/后端       | 🟨   | HBM IP、协议转换器、时钟与复位门控已就位；引脚约束与 300 MHz 收敛待办 |
+| 端到端对拍      | 🟨   | 各子模块均已与参考实现黄金向量对拍；完整 `calculate_hash` 结果尚未逐位验证 |
 
 图例：✅ 已完成 ／ 🟨 部分完成 ／ ⬜ 未开始
 
@@ -729,30 +785,36 @@ done
    - `dataset_gen` 的 8 个程序目前经寄存器接口由主机写入
      （0x8C–0x98），片上 `generateSuperscalar` 未实现。
    - 若要完全脱离主机，需实现 Blake2bGenerator + 调度模型。
-2. **最终哈希路径**
-   - 顶层已用共享的 `blake2b_core` 对 VM 的 64 字节 AesHash1R 结果做
-     Blake2b-256 收尾（`hash_out[255:0]`）；仍需把 VM 内的
-     Scratchpad XOR 折叠替换为规范要求的逐 64 字节块 AesHash1R 压缩。
-   - 8 程序链（RANDOMX_PROGRAM_COUNT = 8）尚未实现：目前每次哈希只跑一个程序。
-3. **`alu_int.v` 的 IMUL_RCP**
-   - 当前 `OP_IMUL_RCP` 直接返回 `src_a`（占位）。需实现 2^128 / b 的
-     倒数计算（长除法迭代或复用 `superscalar_hash` 的倒数单元），
-     `randomx_vm.v` 的 IMUL_RCP 依赖该结果。
-4. **验证补齐**
-   - 缺少 testbench 的模块：`alu_int`、`scratchpad_mem`、`prog_gen`。
+   - 这是目前唯一仍依赖主机参与的算法环节。
+2. **端到端对拍**
    - `sim/tb_randomx_top.v` 改为自校验：与 [tevador/RandomX](https://github.com/tevador/RandomX)
      参考实现做端到端测试向量对拍。
-5. **时序与性能**
+   - 依赖上一项：只要超标量程序仍由主机加载，端到端向量就必须连同这 8 个
+     程序一起从参考实现导出。
+3. **时序与性能**
    - `fpu_double` 流水化（加/乘目前是单周期组合路径），这是 300 MHz
      收敛的主要障碍。
    - `superscalar_hash` 的超标量并行执行端口（性能优化，非正确性阻塞项）。
-6. **板级收尾**
+   - `recip.v` 为逐位除法（64+bsr 周期），IMUL_RCP 密集的程序可考虑
+     用查表/牛顿迭代缩短延迟。
+4. **板级收尾**
    - `vivado/constraints.xdc` 中的 `PACKAGE_PIN` 占位符按具体板卡填实。
    - pblock 的 `CLOCKREGION` 范围按实际 SLR 划分确认。
-7. **工程杂项**
-   - 仓库尚未包含 `LICENSE` 文件（建议与上游 RandomX 兼容的 BSD-3-Clause）。
 
 ### 已完成（归档）
+
+- **IMUL_RCP 与共享倒数单元** — 新增 `rtl/recip.v`（规范 §5.5.11 /
+  `reciprocal.c` 的逐位恢复余数除法），`superscalar_hash` 改为复用该单元，
+  `alu_int` 的 `OP_IMUL_RCP` 由占位改为真正的多周期实现（新增 `busy` 输出）；
+  配套 `sim/tb_alu_int.v` 覆盖全部 19 条 opcode 与 7 组倒数黄金向量。
+- **规范化的最终哈希与 8 程序链** — `randomx_vm` 新增 `do_final` /
+  `regfile_out` 端口，最终哈希由 Scratchpad XOR 折叠改为逐 64 字节块的
+  AesHash1R 流式压缩并把摘要写回 a 寄存器；`randomx_top` 增加 `CHAIN_HASH`
+  阶段，用 Blake2b-512(RegisterFile) 为下一个程序播种，实现
+  RANDOMX_PROGRAM_COUNT = 8 的程序链，最终对 256 字节寄存器堆做 Blake2b-256。
+- **验证补齐** — 新增 `sim/tb_alu_int.v`、`sim/tb_scratchpad_mem.v`、
+  `sim/tb_prog_gen.v`，`make test` 覆盖 14 个 testbench，`make lint` 无告警。
+- **许可** — 添加与上游 RandomX 兼容的 BSD-3-Clause `LICENSE`。
 
 - **AES 原语** — `aes_round.v` 补齐 AESDEC（逆 S-box / InvShiftRows /
   InvMixColumns），`aes_gen1r` / `aes_gen4r` / `aes_hash1r` 换用 RandomX
@@ -760,7 +822,8 @@ done
   重写为「固定初值 + 消息作轮密钥吸收 + xkey0/xkey1 扩散」的流式结构；
   配套黄金向量 testbench `sim/tb_aes.v`。
 - **顶层数据通路** — `randomx_top.v` 的主 FSM 打通
-  CACHE_INIT → DS_GEN → SP_FILL → PROG_GEN → VM_RUN → FINAL_HASH：
+  CACHE_INIT → DS_GEN → SP_FILL → PROG_GEN → VM_RUN → FINAL_HASH
+  （后续又扩展为含 CHAIN_HASH 的 8 程序链，见下文）：
   新增 `dataset_gen.v`（spec §7.3 的 Dataset item 生成，驱动
   `hbm_dataset_if` 写通道）与 `prog_gen.v`（AesGenerator4R 生成程序与
   entropy 并写入 VM），Scratchpad 由 `aes_gen1r` 填充，最终哈希接
@@ -771,8 +834,8 @@ done
 - **Argon2d Cache 填充** — `argon2_fill.v` 与 Argon2 参考实现黄金向量
   逐块比对通过（`sim/tb_argon2_fill.v`）。
 - **`randomx_vm.v` 主体** — 全部指令译码、程序配置（entropy）初始化、
-  规范 §4.6.2 主循环、Scratchpad 载入/回写与最终 XOR 折叠 + AesHash1R，
-  配套自校验 testbench `sim/tb_randomx_vm.v`。
+  规范 §4.6.2 主循环、Scratchpad 载入/回写，配套自校验 testbench
+  `sim/tb_randomx_vm.v`。
 - **Blake2b / FPU / SuperscalarHash** — 均已实现并有自校验 testbench。
 - **后端与板级顶层** — `randomx_hbm_top.v`（复位门控 + 34→33 位地址适配 +
   可选 IP 例化）、`build.tcl` 的 `-tclargs hbm` 构建（HBM IP + AXI4→AXI3
@@ -785,7 +848,7 @@ done
 
 本项目为开源硬件框架骨架，用于 RandomX 算法的 FPGA 研究目的。
 
-RandomX 算法版权归原始作者所有（见 [tevador/RandomX](https://github.com/tevador/RandomX)，BSD-3-Clause）。
+本仓库以 **BSD 3-Clause License** 发布，详见 [`LICENSE`](LICENSE)。
 
-> **待办**：仓库尚未包含 `LICENSE` 文件。请仓库所有者选定并添加正式许可证
-> （建议与上游 RandomX 兼容，例如 BSD-3-Clause）。
+RandomX 算法版权归原始作者所有（见 [tevador/RandomX](https://github.com/tevador/RandomX)，
+同为 BSD-3-Clause）；本项目是该算法的独立硬件（Verilog）实现。
